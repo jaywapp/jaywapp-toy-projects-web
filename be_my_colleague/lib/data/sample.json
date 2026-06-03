@@ -1,0 +1,45 @@
+{
+    "name" : "박준영",
+    "mailAddress" : "jaywapp16@gmail.com",
+    "clubs" : [
+        {
+          "spreadID" : "1234",
+          "name" : "경충FC",
+          "description" : "풋살을 즐겁게 하자",
+          "created" : "2011-01-01",
+          "members" :[
+            {
+              "name" : "박준영",
+              "mailAddress" : "jaywapp16@gmail.com",
+              "phoneNumber" : "01076549816",
+              "permission" : "president"
+            },
+            {
+              "name" : "김총무",
+              "mailAddress" : "satgot@gmail.com",
+              "phoneNumber" : "01012345678",
+              "permission" : "secretary"
+            },
+            {
+              "name" : "홍회원",
+              "mailAddress" : "gildon@gmail.com",
+              "phoneNumber" : "01056781234",
+              "permission" : "normal"
+            }
+          ],
+          "schedules" :[
+            {
+              "name" : "정규일정",
+              "description" : "정규일정입니다.",
+              "location" : "세븐축구클럽",
+              "dateTime" : "2024-09-29",
+              "participantMails" : [
+                "jaywapp16@gmail.com" ,
+                "satgot@gmail.com"
+              ]
+            }
+          ]
+        }
+      
+    ]
+  }

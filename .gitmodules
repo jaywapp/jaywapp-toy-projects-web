@@ -1,0 +1,3 @@
+[submodule "be_my_colleague/lib/submodules/jaywapp-dart-google-sheet"]
+	path = be_my_colleague/lib/submodules/jaywapp-dart-google-sheet
+	url = git@github.com:jaywapp/jaywapp-dart-google-sheet.git
