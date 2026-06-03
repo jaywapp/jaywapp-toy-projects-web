@@ -1,0 +1,798 @@
+// =============================================================================
+// Firestore 보안 규칙
+// =============================================================================
+//
+// [데모 그룹 예외 목록]
+// 개발용 데모 그룹(groupId == "g_demo")에는 아래 예외적 write 규칙이 적용됩니다.
+// 운영 환경에서는 모두 차단되는 정상 경로이므로 보안 위협이 없으나,
+// 의도적 예외임을 명시하여 향후 규칙 변경 시 혼동을 방지합니다.
+//
+//  1. groups/{groupId}/members/{uid} — create
+//     조건: uid.matches('demo_user_[1-5]') && status == 'active'
+//     목적: seedDemoData Cloud Function 없이 클라이언트에서 데모 멤버 생성 허용
+//
+//  2. groups/{groupId}/events/{eventId} — create
+//     조건: _devSeed == true && _devSeedKey == "moyeora_demo_v1"
+//     목적: 클라이언트에서 데모 이벤트 직접 생성 허용
+//
+//  3. groups/{groupId}/events/{eventId} — delete
+//     조건: resource.data._devSeed == true && _devSeedKey == "moyeora_demo_v1"
+//     목적: 데모 데이터 초기화(재시드) 시 이전 이벤트 삭제 허용
+//
+//  4. groups/{groupId}/notices/{noticeId} — create, delete
+//     조건: _devSeed == true && _devSeedKey == "moyeora_demo_v1"
+//     목적: 데모 공지 생성 및 초기화 허용
+//
+// 위 예외는 `AppConfig.enableServerDependentFeatures`가 활성화된 개발 빌드에서만
+// seedDemoData 흐름에 의해 호출됩니다.
+// =============================================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberDoc(groupId) {
+      return get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    function isActiveMember(groupId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid))
+        && memberDoc(groupId).data.status == 'active';
+    }
+
+    function hasPermission(groupId, perm) {
+      let member = memberDoc(groupId).data;
+      return isActiveMember(groupId)
+        && (
+          member.role == 'owner'
+          || (perm == 'finance.manage' && member.role == 'treasurer')
+          || (
+            member.permissions is list
+            && member.permissions.hasAny([perm])
+          )
+          || (
+            member.permissions is map
+            && member.permissions[perm] == true
+          )
+        );
+    }
+
+    function canManageFinance(groupId) {
+      let member = memberDoc(groupId).data;
+      return isActiveMember(groupId)
+        && (
+          member.role == 'owner'
+          || member.role == 'treasurer'
+          || (
+            member.permissions is list
+            && member.permissions.hasAny(['fee.manage', 'finance.manage'])
+          )
+          || (
+            member.permissions is map
+            && (
+              member.permissions['fee.manage'] == true
+              || member.permissions['finance.manage'] == true
+            )
+          )
+        );
+    }
+
+    function isEventResponseOpen(groupId, eventId) {
+      let event = get(/databases/$(database)/documents/groups/$(groupId)/events/$(eventId)).data;
+      return event.isDeleted != true
+        && (
+          !('status' in event)
+          || event.status != 'closed'
+        )
+        && (
+          !('startAt' in event)
+          || event.startAt > request.time
+        )
+        && (
+          !('responseClosedAt' in event)
+          || event.responseClosedAt == null
+         || event.responseClosedAt > request.time
+         );
+    }
+
+    function isValidReactionEmoji(emoji) {
+      return emoji in ['👍', '👏', '❤️', '🙏', '😂'];
+    }
+
+    function isValidPendingJoinRequest(uid) {
+      return request.resource.data.keys().hasOnly([
+        'uid',
+        'status',
+        'displayName',
+        'photoUrl',
+        'requestedAt',
+        'inviteCode'
+      ])
+        && request.resource.data.uid == uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.inviteCode is string
+        && request.resource.data.inviteCode.size() >= 6
+        && (
+          !('displayName' in request.resource.data)
+          || request.resource.data.displayName is string
+        )
+        && (
+          !('photoUrl' in request.resource.data)
+          || request.resource.data.photoUrl is string
+        )
+        && (
+          !('requestedAt' in request.resource.data)
+          || request.resource.data.requestedAt is timestamp
+        );
+    }
+
+    function isOwnerBootstrapMemberCreate(groupId, uid) {
+      return signedIn()
+        && uid == request.auth.uid
+        && exists(/databases/$(database)/documents/groups/$(groupId))
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.ownerId == request.auth.uid
+        && request.resource.data.status == 'active'
+        && request.resource.data.role == 'owner'
+        && request.resource.data.permissions is list
+        && request.resource.data.permissions.hasAll([
+          'member.manage',
+          'event.manage',
+          'finance.manage',
+          'role.manage',
+          'settings.manage'
+        ]);
+    }
+
+    function hasMemberCapacity(groupId) {
+      return exists(/databases/$(database)/documents/groups/$(groupId))
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.limits.memberMax is int
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount is int
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount
+          < get(/databases/$(database)/documents/groups/$(groupId)).data.limits.memberMax;
+    }
+
+    function isValidInviteCodeForGroup(groupId, code) {
+      return exists(/databases/$(database)/documents/inviteCodes/$(code))
+        && get(/databases/$(database)/documents/inviteCodes/$(code)).data.groupId == groupId
+        && get(/databases/$(database)/documents/inviteCodes/$(code)).data.status == 'active'
+        && (
+          !('expiresAt' in get(/databases/$(database)/documents/inviteCodes/$(code)).data)
+          || get(/databases/$(database)/documents/inviteCodes/$(code)).data.expiresAt > request.time
+        );
+    }
+
+    function isValidGroupCreate() {
+      return request.resource.data.keys().hasOnly([
+        'name',
+        'description',
+        'emblemUrl',
+        'ownerId',
+        'status',
+        'plan',
+        'planLabel',
+        'limits',
+        'memberCount',
+        'createdAt',
+        'updatedAt'
+      ])
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'active'
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.name.size() <= 30
+        && (
+          !('description' in request.resource.data)
+          || request.resource.data.description is string
+        )
+        && (
+          !('emblemUrl' in request.resource.data)
+          || (
+            request.resource.data.emblemUrl is string
+            && request.resource.data.emblemUrl.size() <= 500
+          )
+        )
+        && request.resource.data.plan in ['free', 'pro']
+        && request.resource.data.planLabel is string
+        && request.resource.data.limits is map
+        && request.resource.data.limits.keys().hasOnly([
+          'memberMax',
+          'eventCreateMonthlyMax'
+        ])
+        && request.resource.data.limits.memberMax is int
+        && request.resource.data.limits.eventCreateMonthlyMax is int
+        && request.resource.data.memberCount is int
+        && request.resource.data.memberCount == 1
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && (
+          (
+            request.resource.data.plan == 'free'
+            && request.resource.data.limits.memberMax == 10
+            && request.resource.data.limits.eventCreateMonthlyMax == 20
+          ) || (
+            request.resource.data.plan == 'pro'
+            && request.resource.data.limits.memberMax == 200
+            && request.resource.data.limits.eventCreateMonthlyMax == 500
+          )
+        );
+    }
+
+    function isValidPendingMemberApprovalUpdate() {
+      return resource.data.status == 'pending'
+        && request.resource.data.status == 'active'
+        && request.resource.data.role == 'member'
+        && request.resource.data.permissions is list
+        && request.resource.data.permissions.size() == 0
+        && request.resource.data.approvedAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          'status',
+          'role',
+          'permissions',
+          'approvedAt',
+          'updatedAt'
+        ]);
+    }
+
+    function isValidMembershipActivationCreate(groupId) {
+      return request.resource.data.keys().hasOnly([
+          'groupId',
+          'status',
+          'joinedAt',
+          'role',
+          'permissions',
+          'updatedAt'
+        ])
+        && request.resource.data.groupId == groupId
+        && request.resource.data.status == 'active'
+        && request.resource.data.joinedAt is timestamp
+        && request.resource.data.role == 'member'
+        && request.resource.data.permissions is list
+        && request.resource.data.permissions.size() == 0
+        && request.resource.data.updatedAt is timestamp;
+    }
+
+    function isValidMembershipActivationUpdate(groupId) {
+      return request.resource.data.groupId == groupId
+        && request.resource.data.status == 'active'
+        && request.resource.data.joinedAt is timestamp
+        && request.resource.data.role == 'member'
+        && request.resource.data.permissions is list
+        && request.resource.data.permissions.size() == 0
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          'status',
+          'joinedAt',
+          'role',
+          'permissions',
+          'updatedAt'
+        ]);
+    }
+
+    match /users/{uid} {
+      allow read, create, update, delete: if signedIn() && request.auth.uid == uid;
+
+      match /memberships/{groupId} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create: if (signedIn() && request.auth.uid == uid)
+          || (
+            hasPermission(groupId, 'member.manage')
+            && isValidMembershipActivationCreate(groupId)
+          );
+        allow update: if (signedIn() && request.auth.uid == uid)
+          || (
+            hasPermission(groupId, 'member.manage')
+            && isValidMembershipActivationUpdate(groupId)
+          );
+        allow delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    match /inviteCodes/{code} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.groupId is string
+        && hasPermission(request.resource.data.groupId, 'member.manage');
+      allow update: if signedIn()
+        && resource.data.groupId is string
+        && hasPermission(resource.data.groupId, 'member.manage');
+      allow delete: if false;
+    }
+
+    match /beta_reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'title',
+          'body',
+          'category',
+          'createdBy',
+          'createdByName',
+          'status',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 1
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.body is string
+        && request.resource.data.body.size() >= 1
+        && request.resource.data.body.size() <= 2000
+        && request.resource.data.category in ['bug', 'improvement', 'feature', 'other']
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdByName is string
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp;
+      allow read, update, delete: if false;
+    }
+
+    match /groups/{groupId} {
+      allow create: if signedIn() && isValidGroupCreate();
+      allow read: if isActiveMember(groupId);
+      allow update: if hasPermission(groupId, 'settings.manage');
+      allow delete: if false;
+
+      match /members/{uid} {
+        allow read: if isActiveMember(groupId);
+        allow create: if (
+          signedIn()
+          && uid == request.auth.uid
+          && isValidPendingJoinRequest(uid)
+          && hasMemberCapacity(groupId)
+          && isValidInviteCodeForGroup(groupId, request.resource.data.inviteCode)
+        ) || (
+          isOwnerBootstrapMemberCreate(groupId, uid)
+        ) || (
+          isActiveMember(groupId)
+          && groupId == "g_demo"
+          && uid.matches('demo_user_[1-5]')
+          && request.resource.data.status == 'active'
+        );
+        allow update: if hasPermission(groupId, 'member.manage')
+          && isValidPendingMemberApprovalUpdate();
+        allow delete: if false;
+
+        match /fcmTokens/{tokenId} {
+          allow read: if isActiveMember(groupId) && uid == request.auth.uid;
+          allow create, update, delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+
+        match /notificationSettings/{docId} {
+          allow read: if isActiveMember(groupId) && uid == request.auth.uid;
+          allow create, update, delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+      }
+
+      match /invites/{inviteId} {
+        allow read: if hasPermission(groupId, 'member.manage');
+        allow create, update: if hasPermission(groupId, 'member.manage')
+          && request.resource.data.groupId == groupId
+          && request.resource.data.code == inviteId;
+        allow delete: if false;
+      }
+
+      match /events/{eventId} {
+        allow read: if isActiveMember(groupId);
+        allow create: if (
+          hasPermission(groupId, 'event.manage')
+          && request.resource.data.keys().hasOnly([
+            "title",
+            "description",
+            "startAt",
+            "locationName",
+            "address",
+            "location",
+            "status",
+            "responseClosedAt",
+            "updatedAt",
+            "recurrenceEnabled",
+            "recurrenceRule",
+            "recurrenceNextStartAt",
+            "recurrenceRootEventId",
+            "recurrenceGeneratedCount",
+            "autoGenerated",
+            "isDeleted",
+            "createdAt",
+            "createdBy"
+          ])
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 1
+          && request.resource.data.title.size() <= 80
+          && (
+            !('description' in request.resource.data)
+            || (
+              request.resource.data.description is string
+              && request.resource.data.description.size() <= 2000
+            )
+          )
+          && request.resource.data.startAt is timestamp
+          && (
+            !('locationName' in request.resource.data)
+            || request.resource.data.locationName is string
+          )
+          && (
+            !('address' in request.resource.data)
+            || request.resource.data.address is string
+          )
+          && (
+            !('location' in request.resource.data)
+            || request.resource.data.location is string
+          )
+          && request.resource.data.status == 'open'
+          && (
+            !('responseClosedAt' in request.resource.data)
+            || request.resource.data.responseClosedAt == null
+            || request.resource.data.responseClosedAt is timestamp
+          )
+          && request.resource.data.updatedAt is timestamp
+          && (
+            !('recurrenceEnabled' in request.resource.data)
+            || request.resource.data.recurrenceEnabled is bool
+          )
+          && (
+            request.resource.data.recurrenceEnabled != true
+            || (
+              request.resource.data.recurrenceRule in ['weekly', 'biweekly', 'monthly']
+              && request.resource.data.recurrenceNextStartAt is timestamp
+              && request.resource.data.recurrenceRootEventId is string
+              && request.resource.data.recurrenceGeneratedCount is int
+              && request.resource.data.recurrenceGeneratedCount == 0
+            )
+          )
+          && (
+            !('autoGenerated' in request.resource.data)
+            || request.resource.data.autoGenerated is bool
+          )
+          && request.resource.data.isDeleted == false
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.createdBy == request.auth.uid
+        ) || (
+          isActiveMember(groupId)
+          && groupId == "g_demo"
+          && request.resource.data.keys().hasOnly(["title", "startAt", "locationName", "address", "location", "isDeleted", "createdAt", "_devSeed", "_devSeedKey"])
+          && request.resource.data.title is string
+          && request.resource.data.startAt is timestamp
+          && (
+            !('locationName' in request.resource.data)
+            || request.resource.data.locationName is string
+          )
+          && (
+            !('address' in request.resource.data)
+            || request.resource.data.address is string
+          )
+          && (
+            !('location' in request.resource.data)
+            || request.resource.data.location is string
+          )
+          && request.resource.data.isDeleted is bool
+          && (
+            !('_devSeed' in request.resource.data)
+            || request.resource.data._devSeed is bool
+          )
+          && (
+            !('_devSeedKey' in request.resource.data)
+            || request.resource.data._devSeedKey is string
+          )
+        );
+        allow update: if false;
+        allow delete: if isActiveMember(groupId)
+          && groupId == "g_demo"
+          && resource.data._devSeed == true
+          && resource.data._devSeedKey == "moyeora_demo_v1";
+
+        match /responses/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if (
+              isActiveMember(groupId)
+              && isEventResponseOpen(groupId, eventId)
+              && uid == request.auth.uid
+              && (
+                !('uid' in request.resource.data)
+                || request.resource.data.uid == request.auth.uid
+              )
+            ) || (
+              isActiveMember(groupId)
+              && groupId == "g_demo"
+              && uid.matches('demo_user_[1-5]')
+            );
+          allow delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+
+        match /attendances/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if hasPermission(groupId, 'event.manage')
+            && request.resource.data.keys().hasOnly([
+              'uid',
+              'status',
+              'checkedBy',
+              'checkedAt'
+            ])
+            && request.resource.data.uid == uid
+            && request.resource.data.status in ['present', 'late', 'absent']
+            && request.resource.data.checkedBy == request.auth.uid
+            && request.resource.data.checkedAt is timestamp;
+          allow delete: if hasPermission(groupId, 'event.manage');
+        }
+
+        match /comments/{commentId} {
+          allow read: if isActiveMember(groupId);
+          allow create: if isActiveMember(groupId)
+            && request.resource.data.keys().hasOnly([
+              'uid',
+              'displayName',
+              'message',
+              'createdAt',
+              'updatedAt'
+            ])
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.displayName is string
+            && request.resource.data.displayName.size() >= 1
+            && request.resource.data.displayName.size() <= 80
+            && request.resource.data.message is string
+            && request.resource.data.message.size() >= 1
+            && request.resource.data.message.size() <= 500
+            && request.resource.data.createdAt is timestamp
+            && request.resource.data.updatedAt is timestamp;
+          allow update: if false;
+          allow delete: if isActiveMember(groupId)
+            && (
+              resource.data.uid == request.auth.uid
+              || hasPermission(groupId, 'event.manage')
+            );
+
+          match /reactions/{uid} {
+            allow read: if isActiveMember(groupId);
+            allow create, update: if isActiveMember(groupId)
+              && uid == request.auth.uid
+              && request.resource.data.keys().hasOnly([
+                'uid',
+                'emoji',
+                'updatedAt'
+              ])
+              && request.resource.data.uid == request.auth.uid
+              && request.resource.data.emoji is string
+              && isValidReactionEmoji(request.resource.data.emoji)
+              && request.resource.data.updatedAt is timestamp;
+            allow delete: if isActiveMember(groupId) && uid == request.auth.uid;
+          }
+        }
+      }
+
+      match /notices/{noticeId} {
+        allow read: if isActiveMember(groupId);
+        allow create: if (
+          hasPermission(groupId, 'event.manage')
+          && request.resource.data.keys().hasOnly([
+            "title",
+            "body",
+            "pinned",
+            "createdAt",
+            "createdBy"
+          ])
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 1
+          && request.resource.data.title.size() <= 80
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 1
+          && request.resource.data.body.size() <= 5000
+          && request.resource.data.pinned is bool
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.createdBy == request.auth.uid
+        ) || (
+          isActiveMember(groupId)
+          && groupId == "g_demo"
+          && request.resource.data.keys().hasOnly(["title", "body", "pinned", "createdAt", "_devSeed", "_devSeedKey"])
+          && request.resource.data.title is string
+          && request.resource.data.body is string
+          && request.resource.data.pinned is bool
+          && (
+            !('_devSeed' in request.resource.data)
+            || request.resource.data._devSeed is bool
+          )
+          && (
+            !('_devSeedKey' in request.resource.data)
+            || request.resource.data._devSeedKey is string
+          )
+        );
+        allow update: if false;
+        allow delete: if isActiveMember(groupId)
+          && groupId == "g_demo"
+          && resource.data._devSeed == true
+          && resource.data._devSeedKey == "moyeora_demo_v1";
+
+        match /reads/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if isActiveMember(groupId)
+            && uid == request.auth.uid
+            && (
+              !('uid' in request.resource.data)
+              || request.resource.data.uid == request.auth.uid
+            );
+          allow delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+
+        match /reactions/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if isActiveMember(groupId)
+            && uid == request.auth.uid
+            && request.resource.data.keys().hasOnly([
+              'uid',
+              'emoji',
+              'updatedAt'
+            ])
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.emoji is string
+            && isValidReactionEmoji(request.resource.data.emoji)
+            && request.resource.data.updatedAt is timestamp;
+          allow delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+      }
+
+      match /auditLogs/{logId} {
+        allow read: if hasPermission(groupId, 'role.manage');
+        allow create, update, delete: if false;
+      }
+
+      match /suggestions/{suggestionId} {
+        allow read: if isActiveMember(groupId);
+        allow create: if isActiveMember(groupId)
+          && request.resource.data.keys().hasOnly([
+            'title',
+            'body',
+            'isAnonymous',
+            'createdBy',
+            'createdByName',
+            'status',
+            'createdAt',
+            'updatedAt'
+          ])
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 1
+          && request.resource.data.title.size() <= 80
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 1
+          && request.resource.data.body.size() <= 1000
+          && request.resource.data.isAnonymous is bool
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.createdByName is string
+          && request.resource.data.createdByName.size() >= 1
+          && request.resource.data.createdByName.size() <= 60
+          && request.resource.data.status == 'open'
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.updatedAt is timestamp;
+        allow update: if hasPermission(groupId, 'member.manage')
+          && request.resource.data.keys().hasAll(resource.data.keys())
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+            'status',
+            'updatedAt'
+          ])
+          && request.resource.data.status in ['open', 'planned', 'closed']
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if false;
+      }
+
+      match /polls/{pollId} {
+        allow read: if isActiveMember(groupId);
+        allow create: if hasPermission(groupId, 'member.manage')
+          && request.resource.data.keys().hasOnly([
+            'title',
+            'description',
+            'options',
+            'status',
+            'endAt',
+            'createdBy',
+            'createdAt',
+            'updatedAt'
+          ])
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 1
+          && request.resource.data.title.size() <= 80
+          && (
+            !('description' in request.resource.data)
+            || request.resource.data.description is string
+          )
+          && request.resource.data.options is list
+          && request.resource.data.options.size() >= 2
+          && request.resource.data.options.size() <= 6
+          && request.resource.data.status == 'open'
+          && request.resource.data.endAt is timestamp
+          && request.resource.data.endAt > request.time
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.updatedAt is timestamp;
+        allow update: if hasPermission(groupId, 'member.manage')
+          && request.resource.data.keys().hasAll(resource.data.keys())
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+            'status',
+            'updatedAt'
+          ])
+          && request.resource.data.status in ['open', 'closed']
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if false;
+
+        match /votes/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if isActiveMember(groupId)
+            && uid == request.auth.uid
+            && get(/databases/$(database)/documents/groups/$(groupId)/polls/$(pollId)).data.status == 'open'
+            && (
+              !('endAt' in get(/databases/$(database)/documents/groups/$(groupId)/polls/$(pollId)).data)
+              || get(/databases/$(database)/documents/groups/$(groupId)/polls/$(pollId)).data.endAt > request.time
+            )
+            && request.resource.data.keys().hasOnly([
+              'uid',
+              'optionIndex',
+              'votedAt',
+              'updatedAt'
+            ])
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.optionIndex is int
+            && request.resource.data.optionIndex >= 0
+            && request.resource.data.optionIndex
+              < get(/databases/$(database)/documents/groups/$(groupId)/polls/$(pollId)).data.options.size()
+            && request.resource.data.votedAt is timestamp
+            && request.resource.data.updatedAt is timestamp;
+          allow delete: if isActiveMember(groupId) && uid == request.auth.uid;
+        }
+      }
+
+      match /fees/{feeId} {
+        allow read: if isActiveMember(groupId);
+        allow create, update: if canManageFinance(groupId);
+        allow delete: if false;
+
+        match /payments/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update, delete: if false;
+        }
+
+        match /records/{uid} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if canManageFinance(groupId);
+          allow delete: if false;
+        }
+
+        match /expenses/{expenseId} {
+          allow read: if isActiveMember(groupId);
+          allow create, update: if canManageFinance(groupId);
+          allow delete: if false;
+        }
+      }
+
+      match /leaderboards/{docId} {
+        allow read: if isActiveMember(groupId);
+        allow create, update: if isActiveMember(groupId) && groupId == "g_demo";
+        allow delete: if isActiveMember(groupId)
+          && groupId == "g_demo"
+          && resource.data._devSeed == true
+          && resource.data._devSeedKey == "moyeora_demo_v1";
+      }
+
+      match /stats/{docId} {
+        allow read: if isActiveMember(groupId);
+        allow create, update: if isActiveMember(groupId) && groupId == "g_demo";
+        allow delete: if isActiveMember(groupId)
+          && groupId == "g_demo"
+          && resource.data._devSeed == true
+          && resource.data._devSeedKey == "moyeora_demo_v1";
+      }
+
+      match /_dev/{docId} {
+        allow read, create, update: if isActiveMember(groupId) && groupId == "g_demo";
+        allow delete: if false;
+      }
+
+      match /nicknameChangeRequests/{requestId} {
+        allow read: if isActiveMember(groupId);
+        allow create: if isActiveMember(groupId)
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.status == 'pending';
+        allow update, delete: if false;
+      }
+    }
+  }
+}

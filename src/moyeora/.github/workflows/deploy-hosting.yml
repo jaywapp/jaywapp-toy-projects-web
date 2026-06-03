@@ -1,0 +1,81 @@
+﻿name: Deploy Flutter Web to Firebase Hosting
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build web
+        run: flutter build web --release --dart-define=APP_ENV=prod --dart-define=KAKAO_REST_API_KEY=${{ secrets.KAKAO_REST_API_KEY }}
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          echo "value=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Firebase Hosting (live)
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_MOYEORA_DEV }}
+          channelId: live
+          projectId: moyeora-dev
+
+
+  notify-success:
+    needs: [deploy]
+    if: ${{ always() && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram success notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "✅ moyeora" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "⚠️ ${{ github.ref_name }}" \
+            "🌐 https://moyeora-dev.web.app")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"
+
+  notify-failure:
+    needs: [deploy]
+    if: ${{ always() && needs.deploy.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram failure notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "❌ moyeora" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "❓ 빌드/배포 실패 — Actions 로그 확인")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"

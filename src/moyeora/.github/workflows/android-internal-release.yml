@@ -1,0 +1,144 @@
+name: Android Internal Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "lib/**"
+      - "android/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - ".github/workflows/android-internal-release.yml"
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Play Console 출시명"
+        required: false
+        default: "내부 테스트 자동 배포"
+      release_notes:
+        description: "Play Console 출시 노트 (ko-KR)"
+        required: false
+        default: "GitHub Actions 내부 테스트 배포"
+
+permissions:
+  contents: read
+
+jobs:
+  internal-release:
+    runs-on: ubuntu-latest
+    env:
+      PLAY_PACKAGE_NAME: com.jaywapp.moyeora
+      AAB_PATH: ../build/app/outputs/bundle/release/app-release.aab
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: Flutter tests
+        run: flutter test
+
+      - name: Prepare Android signing files
+        shell: bash
+        run: |
+          echo "${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}" | base64 --decode > android/upload-keystore.jks
+          cat > android/key.properties <<EOF
+          storePassword=${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
+          keyPassword=${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          storeFile=../upload-keystore.jks
+          EOF
+
+      - name: Build Android AAB
+        run: flutter build appbundle --release --dart-define=APP_ENV=prod --no-pub
+
+      - name: Prepare Play service account key
+        shell: bash
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > android/play-service-account.json
+
+      - name: Install fastlane gems
+        working-directory: android
+        run: |
+          bundle config set path "vendor/bundle"
+          bundle install --jobs 4 --retry 3
+
+      - name: Upload to Google Play Internal track
+        working-directory: android
+        shell: bash
+        run: |
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          RELEASE_NOTES="${{ github.event.inputs.release_notes }}"
+
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="내부 테스트 자동 배포 #${GITHUB_RUN_NUMBER}"
+          fi
+          if [ -z "$RELEASE_NOTES" ]; then
+            RELEASE_NOTES="GitHub Actions 자동 배포 (${GITHUB_SHA::7})"
+          fi
+
+          bundle exec fastlane android internal_upload \
+            release_name:"$RELEASE_NAME" \
+            release_notes:"$RELEASE_NOTES"
+
+      - name: Cleanup secrets
+        if: always()
+        shell: bash
+        run: |
+          rm -f android/key.properties
+          rm -f android/upload-keystore.jks
+          rm -f android/play-service-account.json
+
+  notify-success:
+    needs: [internal-release]
+    if: ${{ always() && needs['internal-release'].result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram success notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "✅ moyeora" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "⚠️ ${{ github.ref_name }}")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"
+
+  notify-failure:
+    needs: [internal-release]
+    if: ${{ always() && needs['internal-release'].result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram failure notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "❌ moyeora" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "❓ 빌드/배포 실패 — Actions 로그 확인")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"
