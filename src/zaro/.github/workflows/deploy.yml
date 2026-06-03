@@ -1,0 +1,83 @@
+name: Deploy to Firebase Hosting
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build web
+        run: flutter build web --release
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Functions dependencies
+        run: npm ci
+        working-directory: functions
+
+      - name: Write Firebase service account key
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > /tmp/sa.json
+
+      - name: Deploy to Firebase Hosting
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          projectId: zaro-55798
+          channelId: live
+
+      - name: Deploy Firebase Functions and Firestore rules
+        run: npx firebase-tools deploy --only functions,firestore --project zaro-55798
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+
+  notify-success:
+    needs: [deploy]
+    if: ${{ always() && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram success notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "✅ zaro" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "⚠️ ${{ github.ref_name }}" \
+            "🌐 https://zaro-55798.web.app")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"
+
+  notify-failure:
+    needs: [deploy]
+    if: ${{ always() && needs.deploy.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram failure notification
+        run: |
+          TEXT=$(printf '%s\n' \
+            "❌ zaro" \
+            "🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "❓ 빌드/배포 실패 — Actions 로그 확인")
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=8738875192" \
+            --data-urlencode "text=$TEXT"
