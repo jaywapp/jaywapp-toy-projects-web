@@ -1,0 +1,42 @@
+default_platform(:android)
+
+platform :android do
+  desc "이미 빌드된 AAB를 Google Play 내부 테스트 트랙에 업로드"
+  lane :internal_upload do |options|
+    aab_path = options[:aab] || ENV["AAB_PATH"] || "../build/app/outputs/bundle/release/app-release.aab"
+    release_name = options[:release_name] || ENV["RELEASE_NAME"]
+    release_notes = options[:release_notes] || ENV["RELEASE_NOTES"] || "내부 테스트 자동 배포"
+    update_priority = (options[:priority] || ENV["IN_APP_UPDATE_PRIORITY"] || 0).to_i
+
+    unless File.exist?(aab_path)
+      UI.user_error!("AAB 파일을 찾을 수 없습니다: #{aab_path}")
+    end
+
+    upload_to_play_store(
+      track: "internal",
+      aab: aab_path,
+      release_name: release_name,
+      release_status: "completed",
+      in_app_update_priority: update_priority,
+      release_notes: [
+        {
+          language: "ko-KR",
+          text: release_notes,
+        },
+      ],
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      timeout: 300
+    )
+  end
+
+  desc "Flutter release AAB 빌드 후 Google Play 내부 테스트 트랙에 업로드"
+  lane :internal_release do |options|
+    Dir.chdir("..") do
+      sh("flutter", "build", "appbundle", "--release", "--no-pub")
+    end
+    internal_upload(options)
+  end
+end

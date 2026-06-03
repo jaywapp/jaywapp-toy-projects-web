@@ -1,0 +1,3435 @@
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:kakao_flutter_sdk_user/kakao_flutter_sdk_user.dart'
+    show KakaoSdk;
+
+import 'config/app_config.dart';
+import 'config/app_keys.dart';
+import 'dev/firestore_metrics.dart';
+import 'dev/perf_timing.dart';
+import 'firebase_options.dart';
+import 'dev/dev_seed.dart';
+import 'repositories/events_repository.dart';
+import 'repositories/group_repository.dart';
+import 'repositories/notices_repository.dart';
+import 'services/app_cache.dart';
+import 'services/kakao_auth_service.dart';
+import 'services/firebase_custom_auth_service.dart';
+import 'services/google_auth_service.dart';
+import 'services/home_dashboard_service.dart';
+import 'services/user_profile_service.dart';
+import 'services/user_error_message.dart';
+import 'services/map_launcher_service.dart';
+import 'services/notification_infra_service.dart';
+import 'services/permission_service.dart';
+import 'screens/profile/profile_screen.dart';
+import 'screens/finance/finance_screen.dart';
+import 'screens/stats/stats_screen.dart';
+import 'theme/app_theme.dart';
+import 'widgets/app_card.dart';
+import 'widgets/app_loading_button.dart';
+import 'widgets/app_skeleton.dart';
+import 'widgets/app_snackbar.dart';
+import 'widgets/animated_list_entry.dart';
+import 'widgets/debug_panel_card.dart';
+import 'widgets/empty_state.dart';
+import 'widgets/google_login_button.dart';
+import 'widgets/kakao_login_button.dart';
+import 'widgets/section_header.dart';
+import 'widgets/stat_tile.dart';
+import 'widgets/status_badge.dart';
+import 'widgets/transition_page.dart';
+
+final bool kEnableDebugPanel = AppConfig.enableDevTools;
+
+const String kPermissionDeniedMessage = '雅?굝??뇡????怨룸????덈펲. ??怨멸껀嶺??獄?????????筌먦끉逾??琉얠돪??';
+
+const String kMembershipRequiredMessage =
+    '???????????⑤객臾???㏉깴??雅?굝??뇡????怨룸????덈펲. ??怨멸껀嶺??筌먦끉逾?????怨몃뮔 ?띠럾??繞③뜮????덈펲.';
+
+final selectedGroupIdProvider =
+    NotifierProvider<SelectedGroupIdNotifier, String?>(
+      SelectedGroupIdNotifier.new,
+    );
+
+final debugFirestoreErrorProvider =
+    NotifierProvider<DebugFirestoreErrorNotifier, String?>(
+      DebugFirestoreErrorNotifier.new,
+    );
+
+final currentFcmTokenProvider =
+    NotifierProvider<CurrentFcmTokenNotifier, String?>(
+      CurrentFcmTokenNotifier.new,
+    );
+
+final tokenStoredProvider = NotifierProvider<TokenStoredNotifier, bool?>(
+  TokenStoredNotifier.new,
+);
+
+final authStateProvider = StreamProvider<User?>((ref) {
+  return FirebaseAuth.instance.authStateChanges();
+});
+
+final onboardingSeenProvider = FutureProvider<bool>((ref) async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool('onboarding_seen') ?? false;
+});
+
+enum AppThemeMode { system, light, dark }
+
+final themeModeProvider = NotifierProvider<ThemeModeNotifier, AppThemeMode>(
+  ThemeModeNotifier.new,
+);
+
+final groupRepositoryProvider = Provider<GroupRepository>((ref) {
+  return GroupRepository();
+});
+
+final eventsRepositoryProvider = Provider<EventsRepository>((ref) {
+  return EventsRepository();
+});
+
+final noticesRepositoryProvider = Provider<NoticesRepository>((ref) {
+  return NoticesRepository();
+});
+
+class SelectedGroupIdNotifier extends Notifier<String?> {
+  @override
+  String? build() {
+    _loadLastSelectedGroup();
+    return null;
+  }
+
+  Future<void> _loadLastSelectedGroup() async {
+    final prefs = await SharedPreferences.getInstance();
+    final groupId = prefs.getString('last_selected_group_id');
+    if (groupId != null && groupId.isNotEmpty) {
+      state = groupId;
+    }
+  }
+
+  void setGroup(String? groupId) {
+    state = groupId;
+    SharedPreferences.getInstance().then((prefs) {
+      if (groupId == null || groupId.isEmpty) {
+        prefs.remove('last_selected_group_id');
+      } else {
+        prefs.setString('last_selected_group_id', groupId);
+      }
+    });
+  }
+}
+
+class DebugFirestoreErrorNotifier extends Notifier<String?> {
+  @override
+  String? build() => null;
+
+  void setError(String? value) {
+    state = value;
+  }
+}
+
+class CurrentFcmTokenNotifier extends Notifier<String?> {
+  @override
+  String? build() => null;
+
+  void setToken(String? value) {
+    state = value;
+  }
+}
+
+class TokenStoredNotifier extends Notifier<bool?> {
+  @override
+  bool? build() => null;
+
+  void setStored(bool? value) {
+    state = value;
+  }
+}
+
+class ThemeModeNotifier extends Notifier<AppThemeMode> {
+  @override
+  AppThemeMode build() {
+    _load();
+    return AppThemeMode.system;
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('theme_mode') ?? 'system';
+    if (raw == 'light') {
+      state = AppThemeMode.light;
+    } else if (raw == 'dark') {
+      state = AppThemeMode.dark;
+    } else {
+      state = AppThemeMode.system;
+    }
+  }
+
+  Future<void> setMode(AppThemeMode mode) async {
+    state = mode;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('theme_mode', mode.name);
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (!kIsWeb && kKakaoNativeAppKey != 'REPLACE_ME') {
+    KakaoSdk.init(nativeAppKey: kKakaoNativeAppKey);
+  }
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FirestoreMetrics.instance.startPeriodicDump();
+  runApp(const ProviderScope(child: MoyeoraApp()));
+}
+
+final routerProvider = Provider<GoRouter>((ref) {
+  return GoRouter(
+    routes: [
+      GoRoute(
+        path: '/',
+        pageBuilder: (context, state) =>
+            buildTransitionPage(state, const RootGate()),
+        routes: [
+          GoRoute(
+            path: 'notice/:noticeId',
+            pageBuilder: (context, state) {
+              return buildTransitionPage(
+                state,
+                NoticeDetailScreen(noticeId: state.pathParameters['noticeId']!),
+              );
+            },
+          ),
+          GoRoute(
+            path: 'event/:eventId',
+            pageBuilder: (context, state) => buildTransitionPage(
+              state,
+              EventDetailScreen(eventId: state.pathParameters['eventId']!),
+            ),
+          ),
+          GoRoute(
+            path: 'notification-settings',
+            pageBuilder: (context, state) =>
+                buildTransitionPage(state, const NotificationSettingsScreen()),
+          ),
+          GoRoute(
+            path: 'profile',
+            pageBuilder: (context, state) =>
+                buildTransitionPage(state, const ProfileScreen()),
+          ),
+          GoRoute(
+            path: 'admin',
+            pageBuilder: (context, state) =>
+                buildTransitionPage(state, const AdminDashboardScreen()),
+          ),
+          GoRoute(
+            path: 'finance',
+            pageBuilder: (context, state) {
+              final groupId = state.uri.queryParameters['groupId'];
+              if (groupId == null || groupId.isEmpty) {
+                return buildTransitionPage(
+                  state,
+                  const Scaffold(body: Center(child: Text('?잙갭梨띄쳥????ルㅎ臾??? ???용┃???鍮??'))),
+                );
+              }
+              return buildTransitionPage(
+                state,
+                FinanceScreen(groupId: groupId),
+              );
+            },
+          ),
+        ],
+      ),
+    ],
+  );
+});
+
+class MoyeoraApp extends ConsumerWidget {
+  const MoyeoraApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final appThemeMode = ref.watch(themeModeProvider);
+    final themeMode = switch (appThemeMode) {
+      AppThemeMode.light => ThemeMode.light,
+      AppThemeMode.dark => ThemeMode.dark,
+      AppThemeMode.system => ThemeMode.system,
+    };
+    return MaterialApp.router(
+      title: 'Moyeora',
+      debugShowCheckedModeBanner: AppConfig.showDebugBanner,
+      theme: AppTheme.lightTheme,
+      darkTheme: AppTheme.darkTheme,
+      themeMode: themeMode,
+      routerConfig: ref.watch(routerProvider),
+    );
+  }
+}
+
+class RootGate extends ConsumerWidget {
+  const RootGate({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final auth = ref.watch(authStateProvider);
+    final selectedGroupId = ref.watch(selectedGroupIdProvider);
+    final onboarding = ref.watch(onboardingSeenProvider);
+
+    return auth.when(
+      loading: () =>
+          const Scaffold(body: Center(child: CircularProgressIndicator())),
+      error: (error, stack) =>
+          Scaffold(body: Center(child: Text('?筌뤾쑴理????댁쾼: $error'))),
+      data: (user) {
+        return onboarding.when(
+          loading: () =>
+              const Scaffold(body: Center(child: CircularProgressIndicator())),
+          error: (e, st) => Scaffold(body: Center(child: Text('?貫?껆뵳?????댁쾼: $e'))),
+          data: (seen) {
+            if (!seen) return const OnboardingScreen();
+            if (user == null) return const LoginScreen();
+            final profileStream = FirebaseFirestore.instance
+                .collection('users')
+                .doc(user.uid)
+                .snapshots();
+            FirestoreMetrics.instance.addListens();
+            return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: profileStream,
+              builder: (context, profileSnap) {
+                if (!profileSnap.hasData) {
+                  return const Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  );
+                }
+                final profile = profileSnap.data!.data();
+                if (profile == null) {
+                  UserProfileService.ensurePasswordProfile(uid: user.uid);
+                  return const Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  );
+                }
+                final nickname = (profile['nickname']?.toString() ?? '').trim();
+                if (nickname.isEmpty) {
+                  return const ProfileScreen(
+                    forceSetup: true,
+                    forceMessage: '??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??,
+                  );
+                }
+                if (selectedGroupId == null) return const GroupSwitcherScreen();
+                return const AppShell();
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final _emailFocus = FocusNode();
+  final _passwordFocus = FocusNode();
+  bool _signUpMode = false;
+  bool _loading = false;
+  String? _message;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    _emailFocus.dispose();
+    _passwordFocus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runAuth(Future<UserCredential> Function() action) async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    if (email.isEmpty || password.length < 6) {
+      setState(() => _message = '???筌???ㅺ땁 6????怨대쭜 ?????뺢퀡???믩ご????놁졑??怨삵룖?筌뤾쑴??');
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _message = null;
+    });
+
+    try {
+      final credential = await action();
+      final uid = credential.user?.uid;
+      if (uid != null) {
+        final fallback = _emailController.text.trim().split('@').first;
+        await UserProfileService.ensurePasswordProfile(
+          uid: uid,
+          email: credential.user?.email,
+          fallbackNickname: fallback,
+        );
+        if (credential.user != null) {
+          await UserProfileService.syncLinkedProvidersFromAuth(
+            credential.user!,
+          );
+        }
+      }
+    } on FirebaseAuthException catch (e) {
+      setState(() => _message = '?筌뤾쑴理????덉넮: ${e.code}');
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<bool> _promptEmailPasswordLink({
+    required String email,
+    required AuthCredential pendingCredential,
+  }) async {
+    final passwordController = TextEditingController();
+    final linked = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('??ｌ뫒????⑤슡???熬곣뫗??),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('?リ옇?????ｌ뫒??$email)??怨쀬Ŧ ?β돦裕???????ｌ뫒?????⑤슡???紐껊퉵??'),
+              const SizedBox(height: 10),
+              TextField(
+                controller: passwordController,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '?????뺢퀡???),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('???쳛??),
+            ),
+            FilledButton(
+              onPressed: () async {
+                final password = passwordController.text;
+                if (password.isEmpty) return;
+                try {
+                  final signIn = await FirebaseAuth.instance
+                      .signInWithEmailAndPassword(
+                        email: email,
+                        password: password,
+                      );
+                  await signIn.user?.linkWithCredential(pendingCredential);
+                  if (signIn.user != null) {
+                    await UserProfileService.syncLinkedProvidersFromAuth(
+                      signIn.user!,
+                    );
+                  }
+                  if (ctx.mounted) Navigator.of(ctx).pop(true);
+                } on FirebaseAuthException {
+                  if (ctx.mounted) Navigator.of(ctx).pop(false);
+                }
+              },
+              child: const Text('??⑤슡??),
+            ),
+          ],
+        );
+      },
+    );
+    return linked == true;
+  }
+
+  Future<void> _runKakaoLogin() async {
+    if (_loading) return;
+
+    setState(() {
+      _loading = true;
+      _message = null;
+    });
+
+    try {
+      final accessToken = await KakaoAuthService.login();
+      final exchange = await FirebaseCustomAuthService.exchangeKakaoToken(
+        accessToken,
+      );
+      final credential = await FirebaseCustomAuthService.signInWithCustomToken(
+        exchange.customToken,
+      );
+      final uid = credential.user?.uid;
+      if (uid != null) {
+        await UserProfileService.upsertAfterKakaoLogin(
+          uid: uid,
+          kakaoNickname: exchange.kakaoProfileNickname,
+          kakaoPhotoUrl: exchange.kakaoProfileImageUrl,
+          kakaoId: exchange.kakaoId,
+        );
+        if (credential.user != null) {
+          await UserProfileService.syncLinkedProvidersFromAuth(
+            credential.user!,
+          );
+        }
+      }
+    } on FirebaseFunctionsException catch (e) {
+      setState(() => _message = '?곸궠?삭맱???β돦裕??????덉넮: ${e.code}');
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'account-exists-with-different-credential' &&
+          e.email != null &&
+          e.credential != null) {
+        final linked = await _promptEmailPasswordLink(
+          email: e.email!,
+          pendingCredential: e.credential!,
+        );
+        setState(
+          () => _message = linked ? '??ｌ뫒????⑤슡????熬곣뫁???琉????鍮??' : '??ｌ뫒????⑤슡????熬곣뫁???? 嶺뚮쪇沅?쭛???鍮??',
+        );
+      } else if (e.code == 'account-exists-with-different-credential') {
+        setState(
+          () =>
+              _message = '???? ???섎??β돦裕?????濡ル펺??怨쀬Ŧ ?띠럾????낆춨 ??ｌ뫒????낅퉵?? ?β돦裕??????熬곣뫁夷?熬곣뫖?????ｌ뫒????⑤슡???嶺뚯쉳?듸쭛??琉얠돪??',
+        );
+      } else {
+        setState(() => _message = '?곸궠?삭맱???β돦裕??????덉넮: ${e.code}');
+      }
+    } catch (_) {
+      setState(() => _message = '?곸궠?삭맱???β돦裕??????덉넮');
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _runGoogleLogin() async {
+    if (_loading) return;
+    setState(() {
+      _loading = true;
+      _message = null;
+    });
+
+    try {
+      final credential = await GoogleAuthService.signInWithGoogle();
+      final user = credential.user;
+      if (user != null) {
+        await UserProfileService.upsertAfterGoogleLogin(
+          uid: user.uid,
+          email: user.email,
+          googleDisplayName: user.displayName,
+          googlePhotoUrl: user.photoURL,
+        );
+        await UserProfileService.syncLinkedProvidersFromAuth(user);
+      }
+    } on GoogleSignInCanceledException {
+      setState(() => _message = 'Google ?β돦裕??筌뤾쑴逾????쳛???琉????鍮??');
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'account-exists-with-different-credential' &&
+          e.email != null &&
+          e.credential != null) {
+        final linked = await _promptEmailPasswordLink(
+          email: e.email!,
+          pendingCredential: e.credential!,
+        );
+        setState(
+          () => _message = linked ? '??ｌ뫒????⑤슡????熬곣뫁???琉????鍮??' : '??ｌ뫒????⑤슡????熬곣뫁???? 嶺뚮쪇沅?쭛???鍮??',
+        );
+      } else {
+        setState(() => _message = 'Google ?β돦裕??????덉넮: ${e.code}');
+      }
+    } catch (_) {
+      setState(() => _message = 'Google ?β돦裕??????덉넮');
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  bool get _isFormValid {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    return email.contains('@') && password.length >= 6;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Scaffold(
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(20),
+                    child: Image.asset(
+                      'assets/branding/app_icon.png',
+                      width: 80,
+                      height: 80,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '嶺뚮ㅄ維곮굢??,
+                    style: Theme.of(context).textTheme.headlineMedium,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '嶺뚮ㅄ維????怨멸껀????嶺뚳퐢????⑤챷紐드슖?,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  AppCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        TextField(
+                          controller: _emailController,
+                          focusNode: _emailFocus,
+                          textInputAction: TextInputAction.next,
+                          keyboardType: TextInputType.emailAddress,
+                          onChanged: (_) => setState(() {}),
+                          onSubmitted: (_) => _passwordFocus.requestFocus(),
+                          decoration: const InputDecoration(labelText: 'Email'),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _passwordController,
+                          focusNode: _passwordFocus,
+                          textInputAction: TextInputAction.done,
+                          onChanged: (_) => setState(() {}),
+                          onSubmitted: (_) {
+                            if (!_loading && _isFormValid) {
+                              _runAuth(
+                                () => _signUpMode
+                                    ? FirebaseAuth.instance
+                                          .createUserWithEmailAndPassword(
+                                            email: _emailController.text.trim(),
+                                            password: _passwordController.text,
+                                          )
+                                    : FirebaseAuth.instance
+                                          .signInWithEmailAndPassword(
+                                            email: _emailController.text.trim(),
+                                            password: _passwordController.text,
+                                          ),
+                              );
+                            }
+                          },
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Password',
+                          ),
+                        ),
+                        if (_message != null) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _message!,
+                            style: Theme.of(context).textTheme.bodyMedium
+                                ?.copyWith(color: AppTheme.danger),
+                          ),
+                        ],
+                        const SizedBox(height: 16),
+                        SizedBox(
+                          width: double.infinity,
+                          child: SizedBox(
+                            height: 46,
+                            child: AppLoadingButton(
+                              loading: _loading,
+                              enabled: _isFormValid,
+                              label: _signUpMode ? '????싨뤆?쎛?? : '?β돦裕???,
+                              onPressed: () => _runAuth(
+                                () => _signUpMode
+                                    ? FirebaseAuth.instance
+                                          .createUserWithEmailAndPassword(
+                                            email: _emailController.text.trim(),
+                                            password: _passwordController.text,
+                                          )
+                                    : FirebaseAuth.instance
+                                          .signInWithEmailAndPassword(
+                                            email: _emailController.text.trim(),
+                                            password: _passwordController.text,
+                                          ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          width: double.infinity,
+                          child: Center(
+                            child: TextButton(
+                              onPressed: _loading
+                                  ? null
+                                  : () => setState(() {
+                                      _signUpMode = !_signUpMode;
+                                      _message = null;
+                                    }),
+                              child: Text(
+                                _signUpMode ? '?β돦裕??筌뤾쑴紐드슖??熬곥굦?? : '????싨뤆?쎛???곷さ???熬곥굦??,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 4),
+                          child: Row(
+                            children: [
+                              Expanded(child: Divider(height: 1)),
+                              Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 10),
+                                child: Text('???裕?),
+                              ),
+                              Expanded(child: Divider(height: 1)),
+                            ],
+                          ),
+                        ),
+                        if (!kIsWeb)
+                          KakaoLoginButton(
+                            loading: _loading,
+                            onPressed: _runKakaoLogin,
+                          )
+                        else
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            child: Text(
+                              '?곸궠?삭맱???β돦裕??筌? 嶺뚮ㅄ維????繹먮끏???嶺뚯솘????彛???덈펲.',
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                            ),
+                          ),
+                        const SizedBox(height: 8),
+                        GoogleLoginButton(
+                          loading: _loading,
+                          onPressed: _runGoogleLogin,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class OnboardingScreen extends ConsumerStatefulWidget {
+  const OnboardingScreen({super.key});
+
+  @override
+  ConsumerState<OnboardingScreen> createState() => _OnboardingScreenState();
+}
+
+class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
+  final PageController _controller = PageController();
+  int _index = 0;
+  bool _saving = false;
+
+  final List<(String, String)> _slides = const [
+    ('??ㅻ쾴??? ??源놁젧 ??㉱??, '嶺뚮ㅄ維????ㅻ쾴??? ??源놁젧????蹂κ텛???????㉱?洹먮뿫由?筌뤾쑴??'),
+    ('??ㅻ쾴??? ??源놁젧 ??㉱??, '?怨쀫츋?묐씣????????嶺뚳퐢????⑤챷紐드슖???㉱?洹먮뿫由?筌뤾쑴??'),
+    ('??怨멸껀??????關紐??⑤챷紐드슖?, '??ㅻ쾴? ?筌먦끉逾? ?怨쀫츋??嶺뚳퐢?얍칰? ???????㉱?洹먮뜇?긺춯?뼿 ???뺢퀡?녻굢?'),
+  ];
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _complete() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('onboarding_seen', true);
+    ref.invalidate(onboardingSeenProvider);
+    if (mounted) context.go('/');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isLast = _index == _slides.length - 1;
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Expanded(
+                child: PageView.builder(
+                  controller: _controller,
+                  itemCount: _slides.length,
+                  onPageChanged: (i) => setState(() => _index = i),
+                  itemBuilder: (context, i) {
+                    final slide = _slides[i];
+                    return Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(20),
+                          child: Image.asset(
+                            'assets/branding/app_icon.png',
+                            width: 96,
+                            height: 96,
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        Text(
+                          slide.$1,
+                          style: Theme.of(context).textTheme.headlineMedium,
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          slide.$2,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                              ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(
+                  _slides.length,
+                  (i) => Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: _index == i ? 18 : 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: _index == i
+                          ? AppTheme.primary
+                          : Theme.of(context).colorScheme.outlineVariant,
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: SizedBox(
+                  height: 46,
+                  child: AppLoadingButton(
+                    loading: _saving,
+                    label: isLast ? '??戮곗굚???얄뵛' : '???깅쾳',
+                    onPressed: () async {
+                      if (isLast) {
+                        await _complete();
+                      } else {
+                        await _controller.nextPage(
+                          duration: const Duration(milliseconds: 260),
+                          curve: Curves.easeOut,
+                        );
+                      }
+                    },
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class GroupSwitcherScreen extends ConsumerStatefulWidget {
+  const GroupSwitcherScreen({super.key});
+
+  @override
+  ConsumerState<GroupSwitcherScreen> createState() =>
+      _GroupSwitcherScreenState();
+}
+
+class _GroupSwitcherScreenState extends ConsumerState<GroupSwitcherScreen> {
+  final _groupIdController = TextEditingController(text: 'g_demo');
+  bool _checking = false;
+  String? _message;
+  bool? _memberExists;
+  String? _memberStatus;
+  String? _validatedGroupId;
+  String? _validatedGroupName;
+
+  @override
+  void dispose() {
+    _groupIdController.dispose();
+    super.dispose();
+  }
+
+  Future<Map<String, String>> _loadGroupNames(List<String> groupIds) async {
+    final result = <String, String>{};
+    for (final groupId in groupIds) {
+      final groupDoc = await FirebaseFirestore.instance
+          .collection('groups')
+          .doc(groupId)
+          .get();
+      final name = groupDoc.data()?['name'] as String? ?? groupId;
+      result[groupId] = name;
+    }
+    return result;
+  }
+
+  Future<void> _validateGroup() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final groupId = _groupIdController.text.trim();
+    if (user == null || groupId.isEmpty) {
+      setState(() => _message = '?잙갭梨띄쳥?ID?????놁졑??怨삵룖?筌뤾쑴??');
+      return;
+    }
+
+    setState(() {
+      _checking = true;
+      _message = null;
+      _memberExists = null;
+      _memberStatus = null;
+      _validatedGroupId = null;
+      _validatedGroupName = null;
+    });
+
+    try {
+      final groupRef = FirebaseFirestore.instance
+          .collection('groups')
+          .doc(groupId);
+      final memberDoc = await groupRef
+          .collection('members')
+          .doc(user.uid)
+          .get();
+      final status = memberDoc.data()?['status'] as String?;
+      _memberExists = memberDoc.exists;
+      _memberStatus = status;
+
+      if (!memberDoc.exists || status != 'active') {
+        setState(() => _message = kMembershipRequiredMessage);
+        ref.read(debugFirestoreErrorProvider.notifier).setError(null);
+        return;
+      }
+
+      final groupDoc = await groupRef.get();
+      if (!groupDoc.exists) {
+        setState(() => _message = '?잙갭梨띄쳥???쒖굣?묐슗泥? ?브퀡????? ???용????덈펲.');
+        return;
+      }
+
+      setState(() {
+        _validatedGroupId = groupId;
+        _validatedGroupName = groupDoc.data()?['name'] as String? ?? groupId;
+        _message = '?잙갭梨띄쳥??롪틵?嶺??繹먭퍓沅? ??ルㅎ臾??뺢퀗????怨쀬Ŧ 嶺뚯쉳????琉얠돪??';
+      });
+      ref.read(debugFirestoreErrorProvider.notifier).setError(null);
+    } on FirebaseException catch (e) {
+      ref
+          .read(debugFirestoreErrorProvider.notifier)
+          .setError('${e.code}: ${e.message ?? ''}');
+      setState(() {
+        _message = e.code == 'permission-denied'
+            ? kPermissionDeniedMessage
+            : '?잙갭梨띄쳥??롪틵?嶺????덉넮: ${e.code}';
+      });
+    } finally {
+      if (mounted) setState(() => _checking = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    final selectedGroupId = ref.watch(selectedGroupIdProvider);
+    final lastError = ref.watch(debugFirestoreErrorProvider);
+    final currentFcmToken = ref.watch(currentFcmTokenProvider);
+    final tokenStored = ref.watch(tokenStoredProvider);
+
+    if (user == null) {
+      return const Scaffold(body: Center(child: Text('?β돦裕??筌뤾쑴逾??熬곣뫗???紐껊퉵??')));
+    }
+    final membershipsStream = FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .collection('memberships')
+        .where('status', isEqualTo: 'active')
+        .snapshots();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Row(
+          children: [
+            Icon(Icons.groups_outlined, size: 18),
+            SizedBox(width: 6),
+            Text('?잙갭梨띄쳥???ルㅎ臾?),
+          ],
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: membershipsStream,
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return AppCard(
+                  child: ListTile(
+                    title: const Text('?잙갭梨띄쳥??釉띾쐞???釉띯뵛 ???덉넮'),
+                    subtitle: Text(_friendlyError(snapshot.error)),
+                  ),
+                );
+              }
+              if (!snapshot.hasData) {
+                return const AppCard(
+                  child: ListTile(
+                    title: Text('?띠럾????낆춨 ?잙갭梨띄쳥?),
+                    subtitle: Text('?釉띾쐞????노츎 繞?..'),
+                  ),
+                );
+              }
+              final docs = snapshot.data!.docs;
+              if (docs.isEmpty) {
+                return const EmptyState(
+                  icon: Icons.groups_2_outlined,
+                  title: '嶺뚣볦굣??繞벿살탳???잙갭梨띄쳥????怨룸????덈펲',
+                  description: '??怨멸껀嶺뚯쉳?닺굢?㏃물??잙갭梨띄쳥??貫??????븐슙????삵깴???잙갭梨띄쳥?ID??嶺뚣볦굣???琉얠돪??',
+                );
+              }
+              final groupIds = docs.map((d) => d.id).toList();
+              return FutureBuilder<Map<String, String>>(
+                future: _loadGroupNames(groupIds),
+                builder: (context, namesSnapshot) {
+                  final names = namesSnapshot.data ?? <String, String>{};
+                  return AppCard(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('嶺뚣볦굣??繞벿살탳???잙갭梨띄쳥?),
+                          const SizedBox(height: 8),
+                          for (final groupId in groupIds)
+                            ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(
+                                names[groupId] ?? groupId,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              subtitle: Text('ID: $groupId'),
+                              trailing: SizedBox(
+                                height: 44,
+                                child: ElevatedButton(
+                                  onPressed: () {
+                                    HapticFeedback.lightImpact();
+                                    AppCacheService.instance.invalidatePrefix(
+                                      'group:',
+                                    );
+                                    AppCacheService.instance.invalidatePrefix(
+                                      'member:',
+                                    );
+                                    AppCacheService.instance.invalidatePrefix(
+                                      'settings:',
+                                    );
+                                    ref
+                                        .read(selectedGroupIdProvider.notifier)
+                                        .setGroup(groupId);
+                                  },
+                                  child: const Text('??ルㅎ臾?),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+          const SizedBox(height: 12),
+          AppCard(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('?잙갭梨띄쳥?ID??嶺뚣볦굣???筌먦끉逾?),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _groupIdController,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _checking ? null : _validateGroup(),
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Group ID (?? g_demo)',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 44,
+                    child: AppLoadingButton(
+                      loading: _checking,
+                      enabled: _groupIdController.text.trim().isNotEmpty,
+                      label: '?잙갭梨띄쳥??롪틵?嶺?,
+                      onPressed: _validateGroup,
+                    ),
+                  ),
+                  if (_message != null) ...[
+                    const SizedBox(height: 8),
+                    Text(_message!),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (_validatedGroupId != null)
+            AppCard(
+              child: ListTile(
+                title: Text(_validatedGroupName ?? _validatedGroupId!),
+                subtitle: Text('ID: ${_validatedGroupId!}'),
+                trailing: SizedBox(
+                  height: 44,
+                  child: ElevatedButton(
+                    onPressed: () {
+                      HapticFeedback.lightImpact();
+                      AppCacheService.instance.invalidatePrefix('group:');
+                      AppCacheService.instance.invalidatePrefix('member:');
+                      AppCacheService.instance.invalidatePrefix('settings:');
+                      ref
+                          .read(selectedGroupIdProvider.notifier)
+                          .setGroup(_validatedGroupId);
+                    },
+                    child: const Text('??ルㅎ臾?),
+                  ),
+                ),
+              ),
+            ),
+          if (kEnableDebugPanel)
+            DebugPanelCard(
+              uid: user.uid,
+              selectedGroupId: selectedGroupId,
+              memberDocExists: _memberExists,
+              memberStatus: _memberStatus,
+              lastFirestoreError: lastError,
+              currentFcmToken: currentFcmToken,
+              tokenStored: tokenStored,
+              notificationSettingsSummary: null,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class AppShell extends ConsumerStatefulWidget {
+  const AppShell({super.key});
+
+  @override
+  ConsumerState<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends ConsumerState<AppShell> {
+  int _index = 0;
+  String? _configuredGroupId;
+  String? _configuredUid;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _configureNotifications();
+  }
+
+  Future<void> _configureNotifications() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final groupId = ref.read(selectedGroupIdProvider);
+    if (user == null || groupId == null) return;
+    if (_configuredGroupId == groupId && _configuredUid == user.uid) return;
+
+    _configuredGroupId = groupId;
+    _configuredUid = user.uid;
+
+    await NotificationInfraService.instance.configure(
+      groupId: groupId,
+      uid: user.uid,
+      onTokenState: (token, stored) {
+        ref.read(currentFcmTokenProvider.notifier).setToken(token);
+        ref.read(tokenStoredProvider.notifier).setStored(stored);
+      },
+      onNavigateType: (type) {
+        if (!mounted) return;
+        if (type == 'notice') {
+          setState(() => _index = 3);
+        } else if (type == 'event') {
+          setState(() => _index = 1);
+        }
+      },
+      onError: (error) {
+        ref.read(debugFirestoreErrorProvider.notifier).setError(error);
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    NotificationInfraService.instance.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final statsPage = (user != null && groupId != null)
+        ? StatsScreen(groupId: groupId, uid: user.uid)
+        : const Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??'));
+    final pages = [
+      const HomeScreen(),
+      const EventsScreen(),
+      statsPage,
+      const NoticesScreen(),
+      const MoreScreen(),
+    ];
+
+    return Scaffold(
+      body: SafeArea(child: pages[_index]),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _index,
+        onTap: (i) => setState(() => _index = i),
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.home_outlined),
+            label: 'Home',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.event_outlined),
+            label: 'Events',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.stacked_bar_chart_outlined),
+            label: 'Stats',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.campaign_outlined),
+            label: 'Notices',
+          ),
+          BottomNavigationBarItem(icon: Icon(Icons.more_horiz), label: 'More'),
+        ],
+      ),
+    );
+  }
+}
+
+class HomeScreen extends ConsumerWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    if (groupId == null || user == null) {
+      return const Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??'));
+    }
+
+    final lastError = ref.watch(debugFirestoreErrorProvider);
+    final currentFcmToken = ref.watch(currentFcmTokenProvider);
+    final tokenStored = ref.watch(tokenStoredProvider);
+
+    final groupStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .snapshots();
+    final memberStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('members')
+        .doc(user.uid)
+        .snapshots();
+    final settingsStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('members')
+        .doc(user.uid)
+        .collection('notificationSettings')
+        .doc('default')
+        .snapshots();
+    final eventsStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('events')
+        .orderBy('startAt')
+        .limit(10)
+        .snapshots();
+    final noticesStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('notices')
+        .orderBy('createdAt', descending: true)
+        .limit(10)
+        .snapshots();
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: groupStream,
+      builder: (context, g) {
+        if (g.hasError) {
+          final msg = _friendlyError(g.error);
+          ref.read(debugFirestoreErrorProvider.notifier).setError(msg);
+          return Center(
+            child: Padding(padding: const EdgeInsets.all(16), child: Text(msg)),
+          );
+        }
+        if (!g.hasData) {
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: const [
+              AppSkeleton(height: 28, width: 180),
+              SizedBox(height: 12),
+              AppSkeleton(height: 84),
+              SizedBox(height: 12),
+              AppSkeleton(height: 120),
+              SizedBox(height: 12),
+              AppSkeleton(height: 120),
+            ],
+          );
+        }
+
+        final groupName = g.data!.data()?['name'] as String? ?? groupId;
+        final monthText = _currentPeriodKey().replaceAll('-', '.');
+        final profileStream = FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .snapshots();
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        groupName,
+                        style: Theme.of(context).textTheme.headlineMedium,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '$monthText ?筌먲퐢沅?,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                    ],
+                  ),
+                ),
+                StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                  stream: profileStream,
+                  builder: (context, profileSnap) {
+                    final data = profileSnap.data?.data();
+                    final nickname = data?['nickname']?.toString() ?? '';
+                    final photoUrl = data?['photoUrl']?.toString();
+                    final initial = nickname.isNotEmpty
+                        ? nickname[0].toUpperCase()
+                        : null;
+                    return Row(
+                      children: [
+                        InkWell(
+                          borderRadius: BorderRadius.circular(20),
+                          onTap: () => context.push('/profile'),
+                          child: CircleAvatar(
+                            radius: 16,
+                            backgroundImage:
+                                (photoUrl != null && photoUrl.isNotEmpty)
+                                ? NetworkImage(photoUrl)
+                                : null,
+                            child: (photoUrl == null || photoUrl.isEmpty)
+                                ? Text(initial ?? 'U')
+                                : null,
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () =>
+                              context.push('/notification-settings'),
+                          icon: const Icon(Icons.settings_outlined),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            FutureBuilder<Map<String, String>>(
+              future: HomeDashboardService.loadHomeKpi(groupId, user.uid),
+              builder: (context, snapshot) {
+                final kpi =
+                    snapshot.data ??
+                    const {
+                      'attendanceRate': '-',
+                      'unpaidCount': '-',
+                      'upcomingCount': '-',
+                    };
+                return SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      StatTile(
+                        title: '?怨쀫츋?묐씤紐?,
+                        value: kpi['attendanceRate'] ?? '-',
+                      ),
+                      StatTile(
+                        title: '?????亦껋꼶梨뜻쾮?,
+                        value: kpi['unpaidCount'] ?? '-',
+                      ),
+                      StatTile(
+                        title: '???깆젧 ??源놁젧',
+                        value: kpi['upcomingCount'] ?? '-',
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            const SectionHeader(
+              title: '????????洹먮뿫???,
+              icon: Icons.event_note_outlined,
+            ),
+            FutureBuilder<Map<String, String>>(
+              future: HomeDashboardService.loadHomeEngagement(groupId, user.uid),
+              builder: (context, engagement) {
+                final data =
+                    engagement.data ??
+                    const {
+                      'weeklyNoResponse': '-',
+                      'attendanceStreak': '-',
+                      'activityRank': '-',
+                    };
+                return AppCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('???????嶺뚣볦굣???????),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          StatusBadge(
+                            label: '??쒕샍???${data['weeklyNoResponse']}嶺?,
+                            tone: StatusBadgeTone.warning,
+                          ),
+                          StatusBadge(
+                            label: '?怨쀫츋????⑥リ틭 ${data['attendanceStreak']}',
+                            tone: StatusBadgeTone.success,
+                          ),
+                          StatusBadge(
+                            label: '??類ｌ쭢 ??戮곕쭊 ${data['activityRank']}',
+                            tone: StatusBadgeTone.primary,
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: eventsStream,
+              builder: (context, e) {
+                if (e.hasError)
+                  return AppCard(child: Text(_friendlyError(e.error)));
+                if (!e.hasData) return const AppCard(child: Text('?釉띾쐞????노츎 繞?..'));
+
+                final events = e.data!.docs
+                    .where((d) => d.data()['isDeleted'] != true)
+                    .toList();
+                final upcoming = events
+                    .where((d) {
+                      final ts = d.data()['startAt'];
+                      return ts is Timestamp &&
+                          ts.toDate().isAfter(DateTime.now());
+                    })
+                    .take(2)
+                    .toList();
+
+                if (upcoming.isEmpty)
+                  return const AppCard(child: Text('???깆젧????源놁젧????怨룸????덈펲.'));
+
+                return Column(
+                  children: [
+                    for (final event in upcoming)
+                      AppCard(
+                        child:
+                            StreamBuilder<
+                              DocumentSnapshot<Map<String, dynamic>>
+                            >(
+                              stream: FirebaseFirestore.instance
+                                  .collection('groups')
+                                  .doc(groupId)
+                                  .collection('events')
+                                  .doc(event.id)
+                                  .collection('responses')
+                                  .doc(user.uid)
+                                  .snapshots(),
+                              builder: (context, rs) {
+                                final response =
+                                    rs.data?.data()?['response'] as String? ??
+                                    'maybe';
+                                final needsResponse =
+                                    !rs.hasData ||
+                                    !rs.data!.exists ||
+                                    response == 'maybe';
+                                final ts = event.data()['startAt'];
+                                final dateText = ts is Timestamp
+                                    ? _formatDate(ts.toDate())
+                                    : '-';
+                                final primaryPlace = _eventPrimaryPlace(
+                                  event.data(),
+                                );
+                                final address = event
+                                    .data()['address']
+                                    ?.toString();
+                                final mapQuery = _eventMapQuery(event.data());
+                                return Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        dateText,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .labelSmall
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                      ),
+                                      if (needsResponse) ...[
+                                        const SizedBox(height: 6),
+                                        const StatusBadge(
+                                          label: '?筌먲퐢沅?,
+                                          tone: StatusBadgeTone.warning,
+                                        ),
+                                      ],
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        event.data()['title'] as String? ??
+                                            '(??類쏄콬 ??怨몃쾳)',
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.titleMedium,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '???? $primaryPlace',
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.bodySmall,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      if (address != null &&
+                                          address.isNotEmpty &&
+                                          address != primaryPlace) ...[
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          '?낅슣??? $address',
+                                          style: Theme.of(
+                                            context,
+                                          ).textTheme.bodySmall,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ],
+                                      const SizedBox(height: 8),
+                                      if (mapQuery != null)
+                                        Align(
+                                          alignment: Alignment.centerLeft,
+                                          child: TextButton.icon(
+                                            onPressed: () =>
+                                                MapLauncherService.openNaverMapSearch(
+                                                  mapQuery,
+                                                ),
+                                            icon: const Icon(
+                                              Icons.map_outlined,
+                                              size: 16,
+                                            ),
+                                            label: const Text('?筌먦끉逾?),
+                                          ),
+                                        )
+                                      else
+                                        Align(
+                                          alignment: Alignment.centerLeft,
+                                          child: TextButton.icon(
+                                            onPressed: () => AppSnackbar.show(
+                                              context,
+                                              message: '?낅슣????筌먲퐢沅뽪뤆?쎛 ??怨룸????덈펲.',
+                                              type: AppSnackType.info,
+                                            ),
+                                            icon: const Icon(
+                                              Icons.map_outlined,
+                                              size: 16,
+                                            ),
+                                            label: const Text('?筌먦끉逾?),
+                                          ),
+                                        ),
+                                      const SizedBox(height: 4),
+                                      Wrap(
+                                        spacing: 6,
+                                        runSpacing: 6,
+                                        children: [
+                                          _ResponseButton(
+                                            label: '?筌먦끉逾?,
+                                            selected: response == 'maybe',
+                                            onPressed: () => _writeResponse(
+                                              groupId: groupId,
+                                              eventId: event.id,
+                                              uid: user.uid,
+                                              response: 'maybe',
+                                              context: context,
+                                            ),
+                                          ),
+                                          _ResponseButton(
+                                            label: '?筌먦끉逾?,
+                                            selected: response == 'going',
+                                            onPressed: () => _writeResponse(
+                                              groupId: groupId,
+                                              eventId: event.id,
+                                              uid: user.uid,
+                                              response: 'going',
+                                              context: context,
+                                            ),
+                                          ),
+                                          _ResponseButton(
+                                            label: '?筌먦끉逾?,
+                                            selected: response == 'notGoing',
+                                            onPressed: () => _writeResponse(
+                                              groupId: groupId,
+                                              eventId: event.id,
+                                              uid: user.uid,
+                                              response: 'notGoing',
+                                              context: context,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                      ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            const SectionHeader(title: '?筌먦끉逾?, icon: Icons.campaign_outlined),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: noticesStream,
+              builder: (context, n) {
+                if (n.hasError)
+                  return AppCard(child: Text(_friendlyError(n.error)));
+                if (!n.hasData) return const AppCard(child: Text('?釉띾쐞????노츎 繞?..'));
+
+                final notices = n.data!.docs;
+                final pinned = notices
+                    .where((d) => d.data()['pinned'] == true)
+                    .toList();
+                final latest = notices.isNotEmpty ? notices.first : null;
+
+                return AppCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (pinned.isNotEmpty)
+                        Text(
+                          '??μ쪠?? ${pinned.first.data()['title'] ?? '(??類쏄콬 ??怨몃쾳)'}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      if (latest != null) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          '嶺뚣끉裕?? ${latest.data()['title'] ?? '(??類쏄콬 ??怨몃쾳)'}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                      if (pinned.isEmpty && latest == null)
+                        const Text('??戮?뻣????ㅻ쾴??띠럾? ??怨룸????덈펲.'),
+                      const SizedBox(height: 8),
+                      StatusBadge(
+                        label: '嶺뚣끉裕????ㅻ쾴? ${notices.length}濾?,
+                        tone: StatusBadgeTone.primary,
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            const SectionHeader(title: '?筌먦끉逾?, icon: Icons.insights_outlined),
+            FutureBuilder<Map<String, String>>(
+              future: HomeDashboardService.loadMyHomeSummary(groupId, user.uid),
+              builder: (context, summary) {
+                final data = summary.data ?? const {'top3': '-', 'rank': '-'};
+                return AppCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('?怨쀫츋???TOP3: ${data['top3']}'),
+                      const Divider(height: 16),
+                      Text('????戮곕쭊: ${data['rank']}'),
+                    ],
+                  ),
+                );
+              },
+            ),
+            if (kEnableDebugPanel)
+              StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                stream: memberStream,
+                builder: (context, m) {
+                  return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    stream: settingsStream,
+                    builder: (context, ss) {
+                      final settings = ss.data?.data();
+                      final settingsSummary = settings == null
+                          ? '?筌먲퐢沅?
+                          : 'notice=${settings['noticeEnabled'] ?? true}, d1=${settings['eventReminderEnabled'] ?? true}, 13:00=${settings['noResponseReminderEnabled'] ?? true}';
+                      return DebugPanelCard(
+                        uid: user.uid,
+                        selectedGroupId: groupId,
+                        memberDocExists: m.data?.exists,
+                        memberStatus: m.data?.data()?['status']?.toString(),
+                        lastFirestoreError: lastError,
+                        currentFcmToken: currentFcmToken,
+                        tokenStored: tokenStored,
+                        notificationSettingsSummary: settingsSummary,
+                      );
+                    },
+                  );
+                },
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class EventsScreen extends ConsumerStatefulWidget {
+  const EventsScreen({super.key});
+
+  @override
+  ConsumerState<EventsScreen> createState() => _EventsScreenState();
+}
+
+class _EventsScreenState extends ConsumerState<EventsScreen> {
+  Future<void> _refresh(String groupId) async {
+    await FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('events')
+        .limit(1)
+        .get();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    if (groupId == null || user == null)
+      return const Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??'));
+
+    final eventsStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('events')
+        .orderBy('startAt')
+        .snapshots();
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: eventsStream,
+      builder: (context, s) {
+        if (s.hasError)
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(_friendlyError(s.error)),
+            ),
+          );
+        if (!s.hasData) {
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: const [
+              AppSkeleton(height: 24, width: 140),
+              SizedBox(height: 12),
+              AppSkeleton(height: 108),
+              SizedBox(height: 8),
+              AppSkeleton(height: 108),
+            ],
+          );
+        }
+
+        final now = DateTime.now();
+        final allEvents = s.data!.docs
+            .where((d) => d.data()['isDeleted'] != true)
+            .toList();
+        final upcomingEvents =
+            allEvents.where((d) {
+              final ts = d.data()['startAt'];
+              return ts is Timestamp && !ts.toDate().isBefore(now);
+            }).toList()..sort((a, b) {
+              final at =
+                  (a.data()['startAt'] as Timestamp?)?.toDate() ??
+                  DateTime.fromMillisecondsSinceEpoch(0);
+              final bt =
+                  (b.data()['startAt'] as Timestamp?)?.toDate() ??
+                  DateTime.fromMillisecondsSinceEpoch(0);
+              return at.compareTo(bt);
+            });
+        final pastEvents =
+            allEvents.where((d) {
+              final ts = d.data()['startAt'];
+              return ts is Timestamp && ts.toDate().isBefore(now);
+            }).toList()..sort((a, b) {
+              final at =
+                  (a.data()['startAt'] as Timestamp?)?.toDate() ??
+                  DateTime.fromMillisecondsSinceEpoch(0);
+              final bt =
+                  (b.data()['startAt'] as Timestamp?)?.toDate() ??
+                  DateTime.fromMillisecondsSinceEpoch(0);
+              return bt.compareTo(at);
+            });
+        final events = <QueryDocumentSnapshot<Map<String, dynamic>>>[
+          ...upcomingEvents,
+          ...pastEvents,
+        ];
+        if (events.isEmpty) {
+          return EmptyState(
+            icon: Icons.event_busy_outlined,
+            title: '??源놁젧',
+            description: '???깆젧????源놁젧????怨룸????덈펲.',
+            actionLabel: '???됱Ŧ??μ쪠??,
+            onAction: () => _refresh(groupId),
+          );
+        }
+
+        return RefreshIndicator(
+          onRefresh: () => _refresh(groupId),
+          child: ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(16),
+            itemCount: events.length + 1,
+            itemBuilder: (context, i) {
+              if (i == 0)
+                return const SectionHeader(
+                  title: '??????노츎 ??源놁젧',
+                  icon: Icons.event_available_outlined,
+                );
+              final eventDoc = events[i - 1];
+              final eventId = eventDoc.id;
+              final title = eventDoc.data()['title'] as String? ?? '(??類쏄콬 ??怨몃쾳)';
+              final ts = eventDoc.data()['startAt'];
+              final dateText = ts is Timestamp ? _formatDate(ts.toDate()) : '-';
+              final isPast = ts is Timestamp && ts.toDate().isBefore(now);
+              final primaryPlace = _eventPrimaryPlace(eventDoc.data());
+              final address = eventDoc.data()['address']?.toString();
+              final mapQuery = _eventMapQuery(eventDoc.data());
+
+              return AnimatedListEntry(
+                index: i,
+                child: AppCard(
+                  borderColor: isPast ? AppTheme.warning : null,
+                  child: InkWell(
+                    onTap: () => context.push('/event/$eventId'),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          dateText,
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          title,
+                          style: Theme.of(context).textTheme.titleMedium,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (isPast) ...[
+                          const SizedBox(height: 6),
+                          const StatusBadge(
+                            label: '?筌먦끉逾?,
+                            tone: StatusBadgeTone.warning,
+                          ),
+                        ],
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '???? $primaryPlace',
+                                style: Theme.of(context).textTheme.bodySmall,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () {
+                                if (mapQuery == null) {
+                                  AppSnackbar.show(
+                                    context,
+                                    message: '?낅슣????筌먲퐢沅뽪뤆?쎛 ??怨룸????덈펲.',
+                                    type: AppSnackType.info,
+                                  );
+                                  return;
+                                }
+                                MapLauncherService.openNaverMapSearch(mapQuery);
+                              },
+                              tooltip: '?筌먦끉逾?,
+                              icon: const Icon(Icons.map_outlined, size: 18),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ],
+                        ),
+                        if (address != null &&
+                            address.isNotEmpty &&
+                            address != primaryPlace) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            '?낅슣??? $address',
+                            style: Theme.of(context).textTheme.bodySmall,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            _ResponseButton(
+                              label: '亦껋꼶梨??,
+                              selected: false,
+                              onPressed: isPast
+                                  ? null
+                                  : () => _writeResponse(
+                                      groupId: groupId,
+                                      eventId: eventId,
+                                      uid: user.uid,
+                                      response: 'maybe',
+                                      context: context,
+                                    ),
+                            ),
+                            _ResponseButton(
+                              label: '嶺뚣볦굣??,
+                              selected: false,
+                              onPressed: isPast
+                                  ? null
+                                  : () => _writeResponse(
+                                      groupId: groupId,
+                                      eventId: eventId,
+                                      uid: user.uid,
+                                      response: 'going',
+                                      context: context,
+                                    ),
+                            ),
+                            _ResponseButton(
+                              label: '?釉띾쐠揶?,
+                              selected: false,
+                              onPressed: isPast
+                                  ? null
+                                  : () => _writeResponse(
+                                      groupId: groupId,
+                                      eventId: eventId,
+                                      uid: user.uid,
+                                      response: 'notGoing',
+                                      context: context,
+                                    ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+class EventDetailScreen extends ConsumerStatefulWidget {
+  const EventDetailScreen({super.key, required this.eventId});
+
+  final String eventId;
+
+  @override
+  ConsumerState<EventDetailScreen> createState() => _EventDetailScreenState();
+}
+
+class _EventDetailScreenState extends ConsumerState<EventDetailScreen> {
+  bool _showAttendance = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    if (groupId == null || user == null) {
+      return const Scaffold(body: Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??')));
+    }
+
+    final eventRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('events')
+        .doc(widget.eventId);
+    final myMemberRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('members')
+        .doc(user.uid);
+    final myResponseRef = eventRef.collection('responses').doc(user.uid);
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: myMemberRef.snapshots(),
+      builder: (context, myMember) {
+        final permission = PermissionService.fromMemberData(
+          myMember.data?.data(),
+        );
+        final canViewAttendance =
+            permission.canManageMembers() || permission.canManageEvents();
+
+        return Scaffold(
+          appBar: AppBar(
+            title: const Row(
+              children: [
+                Icon(Icons.event_note_outlined, size: 18),
+                SizedBox(width: 6),
+                Text('??源놁젧 ??⑤㈇??),
+              ],
+            ),
+          ),
+          body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+            stream: eventRef.snapshots(),
+            builder: (context, eventSnap) {
+              if (eventSnap.hasError)
+                return Center(child: Text(_friendlyError(eventSnap.error)));
+              if (!eventSnap.hasData)
+                return const Center(child: CircularProgressIndicator());
+              final data = eventSnap.data!.data();
+              if (data == null || data['isDeleted'] == true) {
+                return const Center(child: Text('???????源놁젧???낅퉵??'));
+              }
+
+              final title = data['title']?.toString() ?? '(??類쏄콬 ??怨몃쾳)';
+              final ts = data['startAt'];
+              final dateText = ts is Timestamp ? _formatDate(ts.toDate()) : '-';
+              final isPast =
+                  ts is Timestamp && ts.toDate().isBefore(DateTime.now());
+              final primaryPlace = _eventPrimaryPlace(data);
+              final address = data['address']?.toString();
+              final mapQuery = _eventMapQuery(data);
+
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  AppCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          dateText,
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          title,
+                          style: Theme.of(context).textTheme.headlineMedium,
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          '???? $primaryPlace',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        if (address != null &&
+                            address.isNotEmpty &&
+                            address != primaryPlace) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            '?낅슣??? $address',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: () {
+                            if (mapQuery == null) {
+                              AppSnackbar.show(
+                                context,
+                                message: '?낅슣????筌먲퐢沅뽪뤆?쎛 ??怨룸????덈펲.',
+                                type: AppSnackType.info,
+                              );
+                              return;
+                            }
+                            MapLauncherService.openNaverMapSearch(mapQuery);
+                          },
+                          icon: const Icon(Icons.map_outlined),
+                          label: const Text('嶺뚯솘??????⒱뵛'),
+                        ),
+                        const SizedBox(height: 12),
+                        StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                          stream: myResponseRef.snapshots(),
+                          builder: (context, r) {
+                            final selected =
+                                r.data?.data()?['response'] as String? ??
+                                'maybe';
+                            return Wrap(
+                              spacing: 6,
+                              runSpacing: 6,
+                              children: [
+                                _ResponseButton(
+                                  label: '亦껋꼶梨??,
+                                  selected: selected == 'maybe',
+                                  onPressed: isPast
+                                      ? null
+                                      : () => _writeResponse(
+                                          groupId: groupId,
+                                          eventId: widget.eventId,
+                                          uid: user.uid,
+                                          response: 'maybe',
+                                          context: context,
+                                        ),
+                                ),
+                                _ResponseButton(
+                                  label: '嶺뚣볦굣??,
+                                  selected: selected == 'going',
+                                  onPressed: isPast
+                                      ? null
+                                      : () => _writeResponse(
+                                          groupId: groupId,
+                                          eventId: widget.eventId,
+                                          uid: user.uid,
+                                          response: 'going',
+                                          context: context,
+                                        ),
+                                ),
+                                _ResponseButton(
+                                  label: '?釉띾쐠揶?,
+                                  selected: selected == 'notGoing',
+                                  onPressed: isPast
+                                      ? null
+                                      : () => _writeResponse(
+                                          groupId: groupId,
+                                          eventId: widget.eventId,
+                                          uid: user.uid,
+                                          response: 'notGoing',
+                                          context: context,
+                                        ),
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                        if (isPast) ...[
+                          const SizedBox(height: 8),
+                          const Text('嶺뚯솘?????源놁젧???낅퉵?? ??얜Ŧ堉???瑜곸젧?????ル┰??紐껊퉵??'),
+                        ],
+                      ],
+                    ),
+                  ),
+                  if (canViewAttendance) ...[
+                    AppCard(
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(
+                          Icons.assignment_turned_in_outlined,
+                        ),
+                        title: const Text('嶺뚣볦굣???熬곥굦??),
+                        subtitle: const Text('嶺뚮、?뉓떋?????얜Ŧ堉??筌먦끉逾?),
+                        trailing: Icon(
+                          _showAttendance
+                              ? Icons.expand_less
+                              : Icons.expand_more,
+                        ),
+                        onTap: () =>
+                            setState(() => _showAttendance = !_showAttendance),
+                      ),
+                    ),
+                    if (_showAttendance)
+                      StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        stream: FirebaseFirestore.instance
+                            .collection('groups')
+                            .doc(groupId)
+                            .collection('members')
+                            .where('status', isEqualTo: 'active')
+                            .snapshots(),
+                        builder: (context, membersSnap) {
+                          if (membersSnap.hasError)
+                            return AppCard(
+                              child: Text(_friendlyError(membersSnap.error)),
+                            );
+                          if (!membersSnap.hasData)
+                            return const AppCard(
+                              child: Text('嶺뚣볦굣???熬곥굦???釉띾쐞????노츎 繞?..'),
+                            );
+
+                          return StreamBuilder<
+                            QuerySnapshot<Map<String, dynamic>>
+                          >(
+                            stream: eventRef
+                                .collection('responses')
+                                .snapshots(),
+                            builder: (context, responsesSnap) {
+                              if (responsesSnap.hasError)
+                                return AppCard(
+                                  child: Text(
+                                    _friendlyError(responsesSnap.error),
+                                  ),
+                                );
+                              if (!responsesSnap.hasData)
+                                return const AppCard(
+                                  child: Text('?筌먦끉逾??釉띾쐞????노츎 繞?..'),
+                                );
+
+                              final members = membersSnap.data!.docs;
+                              final responseByUid =
+                                  <String, Map<String, dynamic>>{
+                                    for (final r in responsesSnap.data!.docs)
+                                      r.id: r.data(),
+                                  };
+
+                              var going = 0;
+                              var maybe = 0;
+                              var notGoing = 0;
+                              var noResponse = 0;
+
+                              final rows = <_AttendanceRowData>[];
+                              for (final m in members) {
+                                final uid = m.id;
+                                final nickname =
+                                    m
+                                        .data()['public']?['nickname']
+                                        ?.toString() ??
+                                    uid;
+                                final responseData = responseByUid[uid];
+                                final response = responseData?['response']
+                                    ?.toString();
+                                final respondedAt =
+                                    responseData?['respondedAt'];
+                                final responseLabel = switch (response) {
+                                  'going' => '?筌먦끉逾?,
+                                  'maybe' => '?筌먦끉逾?,
+                                  'notGoing' => '?筌먦끉逾?,
+                                  _ => '亦껋꼶梨???,
+                                };
+
+                                switch (response) {
+                                  case 'going':
+                                    going++;
+                                    break;
+                                  case 'maybe':
+                                    maybe++;
+                                    break;
+                                  case 'notGoing':
+                                    notGoing++;
+                                    break;
+                                  default:
+                                    noResponse++;
+                                    break;
+                                }
+
+                                rows.add(
+                                  _AttendanceRowData(
+                                    nickname: nickname,
+                                    responseLabel: responseLabel,
+                                    respondedAt: respondedAt is Timestamp
+                                        ? _formatDate(respondedAt.toDate())
+                                        : null,
+                                  ),
+                                );
+                              }
+
+                              return AppCard(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Wrap(
+                                      spacing: 8,
+                                      runSpacing: 8,
+                                      children: [
+                                        StatusBadge(
+                                          label: '?筌먦끉逾?$going',
+                                          tone: StatusBadgeTone.success,
+                                        ),
+                                        StatusBadge(
+                                          label: '?筌먦끉逾?$maybe',
+                                          tone: StatusBadgeTone.warning,
+                                        ),
+                                        StatusBadge(
+                                          label: '?筌먦끉逾?$notGoing',
+                                          tone: StatusBadgeTone.danger,
+                                        ),
+                                        StatusBadge(
+                                          label: '?筌먦끉逾?noResponse',
+                                          tone: StatusBadgeTone.primary,
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 12),
+                                    for (final row in rows)
+                                      ListTile(
+                                        contentPadding: EdgeInsets.zero,
+                                        dense: true,
+                                        title: Text(row.nickname),
+                                        subtitle: row.respondedAt == null
+                                            ? null
+                                            : Text(row.respondedAt!),
+                                        trailing: Text(row.responseLabel),
+                                      ),
+                                  ],
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                  ],
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _AttendanceRowData {
+  const _AttendanceRowData({
+    required this.nickname,
+    required this.responseLabel,
+    required this.respondedAt,
+  });
+
+  final String nickname;
+  final String responseLabel;
+  final String? respondedAt;
+}
+
+class NoticesScreen extends ConsumerStatefulWidget {
+  const NoticesScreen({super.key});
+
+  @override
+  ConsumerState<NoticesScreen> createState() => _NoticesScreenState();
+}
+
+class _NoticesScreenState extends ConsumerState<NoticesScreen> {
+  Future<void> _refresh(String groupId) async {
+    await FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('notices')
+        .limit(1)
+        .get();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    if (groupId == null || user == null)
+      return const Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??'));
+
+    final noticesStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('notices')
+        .orderBy('createdAt', descending: true)
+        .limit(30)
+        .snapshots();
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: noticesStream,
+      builder: (context, s) {
+        if (s.hasError)
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(_friendlyError(s.error)),
+            ),
+          );
+        if (!s.hasData) {
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: const [
+              AppSkeleton(height: 24, width: 90),
+              SizedBox(height: 12),
+              AppSkeleton(height: 96),
+              SizedBox(height: 8),
+              AppSkeleton(height: 96),
+            ],
+          );
+        }
+
+        final notices = s.data!.docs.toList();
+        if (notices.isEmpty) {
+          return EmptyState(
+            icon: Icons.campaign_outlined,
+            title: '??ㅻ쾴?????,
+            description: '??怨멸껀嶺뚯쉳?????ㅻ쾴????繹먮굞夷??濡?듆 ???????戮?뻣??紐껊퉵??',
+            actionLabel: '???됱Ŧ??μ쪠??,
+            onAction: () => _refresh(groupId),
+          );
+        }
+        notices.sort((a, b) {
+          final ap = a.data()['pinned'] == true ? 1 : 0;
+          final bp = b.data()['pinned'] == true ? 1 : 0;
+          if (ap != bp) return bp.compareTo(ap);
+          final at = a.data()['createdAt'];
+          final bt = b.data()['createdAt'];
+          final ad = at is Timestamp
+              ? at.toDate()
+              : DateTime.fromMillisecondsSinceEpoch(0);
+          final bd = bt is Timestamp
+              ? bt.toDate()
+              : DateTime.fromMillisecondsSinceEpoch(0);
+          return bd.compareTo(ad);
+        });
+
+        return RefreshIndicator(
+          onRefresh: () => _refresh(groupId),
+          child: ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(16),
+            itemCount: notices.length + 1,
+            itemBuilder: (context, i) {
+              if (i == 0)
+                return const SectionHeader(
+                  title: '嶺뚣끉裕????ㅻ쾴?',
+                  icon: Icons.notifications_active_outlined,
+                );
+              final n = notices[i - 1];
+              final title = n.data()['title'] as String? ?? '(??類쏄콬 ??怨몃쾳)';
+              final body = n.data()['body'] as String? ?? '';
+              final pinned = n.data()['pinned'] == true;
+
+              return AnimatedListEntry(
+                index: i,
+                child: AppCard(
+                  borderColor: pinned ? AppTheme.primary : null,
+                  child: InkWell(
+                    onTap: () => context.push('/notice/${n.id}'),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                title,
+                                style: Theme.of(context).textTheme.titleMedium,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (pinned)
+                              const Padding(
+                                padding: EdgeInsets.only(left: 6),
+                                child: StatusBadge(
+                                  label: '??μ쪠??,
+                                  tone: StatusBadgeTone.primary,
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          body,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+class NoticeDetailScreen extends ConsumerStatefulWidget {
+  const NoticeDetailScreen({super.key, required this.noticeId});
+
+  final String noticeId;
+
+  @override
+  ConsumerState<NoticeDetailScreen> createState() => _NoticeDetailScreenState();
+}
+
+class _NoticeDetailScreenState extends ConsumerState<NoticeDetailScreen> {
+  bool _wroteRead = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_wroteRead) {
+      _wroteRead = true;
+      _writeReadReceipt();
+    }
+  }
+
+  Future<void> _writeReadReceipt() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final groupId = ref.read(selectedGroupIdProvider);
+    if (user == null || groupId == null) return;
+
+    try {
+      await ref
+          .read(noticesRepositoryProvider)
+          .markNoticeRead(
+            groupId: groupId,
+            noticeId: widget.noticeId,
+            uid: user.uid,
+          );
+    } on FirebaseException {
+      // noop
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    if (groupId == null)
+      return const Scaffold(body: Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??')));
+
+    final stream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('notices')
+        .doc(widget.noticeId)
+        .snapshots();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Row(
+          children: [
+            Icon(Icons.article_outlined, size: 18),
+            SizedBox(width: 6),
+            Text('??ㅻ쾴? ??⑤㈇??),
+          ],
+        ),
+      ),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: stream,
+        builder: (context, s) {
+          if (s.hasError)
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(_friendlyError(s.error)),
+              ),
+            );
+          if (!s.hasData)
+            return const Center(child: CircularProgressIndicator());
+          final data = s.data!.data();
+          if (data == null)
+            return const Center(child: Text('??ㅻ쾴? ??쒖굣?묐슚紐?嶺뚢돦堉??????怨룸????덈펲.'));
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              AppCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      data['title'] as String? ?? '(??類쏄콬 ??怨몃쾳)',
+                      style: Theme.of(context).textTheme.headlineMedium,
+                    ),
+                    const SizedBox(height: 12),
+                    const Divider(height: 1),
+                    const SizedBox(height: 12),
+                    Text(
+                      data['body'] as String? ?? '',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyMedium?.copyWith(height: 1.55),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class MoreScreen extends ConsumerWidget {
+  const MoreScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final user = FirebaseAuth.instance.currentUser;
+    final gid = ref.watch(selectedGroupIdProvider);
+    if (user == null) {
+      return const SizedBox.shrink();
+    }
+    final memberStream = gid == null
+        ? const Stream<DocumentSnapshot<Map<String, dynamic>>>.empty()
+        : FirebaseFirestore.instance
+              .collection('groups')
+              .doc(gid)
+              .collection('members')
+              .doc(user.uid)
+              .snapshots();
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: memberStream,
+      builder: (context, snapshot) {
+        final mode = ref.watch(themeModeProvider);
+        final permission = PermissionService.fromMemberData(
+          snapshot.data?.data(),
+        );
+        final adminEnabled =
+            gid != null && permission.canAccessAdminDashboard();
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            const SectionHeader(title: '??븐뼔沅뽫뼨?, icon: Icons.more_horiz),
+            StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .snapshots(),
+              builder: (context, profileSnap) {
+                final p = profileSnap.data?.data() ?? <String, dynamic>{};
+                final nickname = p['nickname']?.toString().trim();
+                final photoUrl = p['photoUrl']?.toString();
+                final provider = p['provider']?.toString();
+                final title = (nickname != null && nickname.isNotEmpty)
+                    ? nickname
+                    : (user.email ?? '???筌????怨몃쾳');
+                final initial = title.isNotEmpty ? title[0].toUpperCase() : 'U';
+                return AppCard(
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: CircleAvatar(
+                      backgroundImage: (photoUrl != null && photoUrl.isNotEmpty)
+                          ? NetworkImage(photoUrl)
+                          : null,
+                      child: (photoUrl == null || photoUrl.isEmpty)
+                          ? Text(initial)
+                          : null,
+                    ),
+                    title: Text(title),
+                    subtitle: Text(
+                      provider == null || provider.isEmpty
+                          ? (user.email ?? '???筌????怨몃쾳')
+                          : '${user.email ?? '???筌????怨몃쾳'} ($provider)',
+                    ),
+                  ),
+                );
+              },
+            ),
+            AppCard(
+              child: ListTile(
+                title: Text(user.email ?? '???筌????怨몃쾳'),
+                subtitle: Text('??ルㅎ臾??잙갭梨띄쳥? ${gid ?? '(??怨몃쾳)'}'),
+              ),
+            ),
+            AppCard(
+              child: ListTile(
+                title: const Text('???熬곣뫁夷??),
+                onTap: () => context.push('/profile'),
+              ),
+            ),
+            AppCard(
+              child: ListTile(
+                title: const Text('???逾????깆젧'),
+                onTap: () => context.push('/notification-settings'),
+              ),
+            ),
+            if (gid != null)
+              AppCard(
+                child: ListTile(
+                  title: const Text('???????㉱??),
+                  subtitle: const Text('??븐뼦????????熬곥굦??????? ??⑤객臾?),
+                  onTap: () => context.push('/finance?groupId=$gid'),
+                ),
+              ),
+            if (adminEnabled)
+              AppCard(
+                child: ListTile(
+                  title: const Text('Admin Dashboard'),
+                  subtitle: const Text('Overview / Approvals / Fees / Audit'),
+                  onTap: () => context.push('/admin'),
+                ),
+              ),
+            if (AppConfig.enableDevTools)
+              AppCard(
+                child: ListTile(
+                  title: const Text('[DEV] ??⑤틳嫄???⑥щ턄????諛댁뎽'),
+                  subtitle: const Text('??ㅻ쾴?/??源놁젧/???????????リ옇?????⑥щ턄????諛댁뎽'),
+                  onTap: () async {
+                    try {
+                      final seeded = await seedDemoMembersAndData(
+                        'g_demo',
+                        user.uid,
+                      );
+                      if (!context.mounted) return;
+                      AppSnackbar.show(
+                        context,
+                        message: seeded ? '??⑤틳嫄???⑥щ턄????諛댁뎽 ?熬곣뫁?? : '??⑤틳嫄???⑥щ턄????諛댁뎽 ???덉넮',
+                        type: AppSnackType.success,
+                      );
+                    } on FirebaseException catch (e) {
+                      if (!context.mounted) return;
+                      final message = e.code == 'permission-denied'
+                          ? kPermissionDeniedMessage
+                          : '嶺뚳퐣瑗?????덉넮: ${e.code}';
+                      AppSnackbar.show(
+                        context,
+                        message: message,
+                        type: AppSnackType.error,
+                      );
+                    } catch (_) {
+                      if (!context.mounted) return;
+                      AppSnackbar.show(
+                        context,
+                        message: '??⑤틳嫄???⑥щ턄????諛댁뎽 ???덉넮',
+                        type: AppSnackType.error,
+                      );
+                    }
+                  },
+                ),
+              ),
+            if (AppConfig.enableDevTools)
+              AppCard(
+                child: ListTile(
+                  title: const Text('[DEV] ??⑤틳嫄???⑥щ턄???貫?껆뵳??????繹??),
+                  subtitle: const Text('?リ옇?????⑤틳嫄???⑥щ턄??? ??????겶????곕뻣 ??諛댁뎽'),
+                  onTap: () async {
+                    try {
+                      final seeded = await resetDemoSeedAndReseed(
+                        'g_demo',
+                        user.uid,
+                      );
+                      if (!context.mounted) return;
+                      AppSnackbar.show(
+                        context,
+                        message: seeded ? '??⑤틳嫄???⑥щ턄????繹???熬곣뫁?? : '??⑤틳嫄???⑥щ턄????繹?????덉넮',
+                        type: seeded
+                            ? AppSnackType.success
+                            : AppSnackType.error,
+                      );
+                    } on FirebaseException catch (e) {
+                      if (!context.mounted) return;
+                      final message = e.code == 'permission-denied'
+                          ? kPermissionDeniedMessage
+                          : '嶺뚳퐣瑗?????덉넮: ${e.code}';
+                      AppSnackbar.show(
+                        context,
+                        message: message,
+                        type: AppSnackType.error,
+                      );
+                    } catch (_) {
+                      if (!context.mounted) return;
+                      AppSnackbar.show(
+                        context,
+                        message: '??⑤틳嫄???⑥щ턄????繹?????댁쾼',
+                        type: AppSnackType.error,
+                      );
+                    }
+                  },
+                ),
+              ),
+            AppCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('???異?),
+                  const SizedBox(height: 8),
+                  SegmentedButton<AppThemeMode>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(
+                        value: AppThemeMode.system,
+                        label: Text('System'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemeMode.light,
+                        label: Text('Light'),
+                      ),
+                      ButtonSegment(
+                        value: AppThemeMode.dark,
+                        label: Text('Dark'),
+                      ),
+                    ],
+                    selected: {mode},
+                    onSelectionChanged: (set) =>
+                        ref.read(themeModeProvider.notifier).setMode(set.first),
+                  ),
+                ],
+              ),
+            ),
+            AppCard(
+              child: ListTile(
+                title: const Text('?잙갭梨띄쳥???ルㅎ臾??怨쀬Ŧ ?????),
+                onTap: () {
+                  AppCacheService.instance.invalidatePrefix('group:');
+                  AppCacheService.instance.invalidatePrefix('member:');
+                  AppCacheService.instance.invalidatePrefix('settings:');
+                  ref.read(selectedGroupIdProvider.notifier).setGroup(null);
+                },
+              ),
+            ),
+            AppCard(
+              child: ListTile(
+                title: const Text('?β돦裕??熬곣뫗??),
+                onTap: () async {
+                  AppCacheService.instance.clearAll();
+                  ref.read(selectedGroupIdProvider.notifier).setGroup(null);
+                  await FirebaseAuth.instance.signOut();
+                },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class AdminDashboardScreen extends ConsumerStatefulWidget {
+  const AdminDashboardScreen({super.key});
+
+  @override
+  ConsumerState<AdminDashboardScreen> createState() =>
+      _AdminDashboardScreenState();
+}
+
+class _AdminDashboardScreenState extends ConsumerState<AdminDashboardScreen> {
+  final Set<String> _approving = <String>{};
+
+  Future<void> _approve({
+    required BuildContext context,
+    required String groupId,
+    required String userId,
+  }) async {
+    if (_approving.contains(userId)) return;
+    await HapticFeedback.lightImpact();
+    setState(() => _approving.add(userId));
+    try {
+      final callable = FirebaseFunctions.instanceFor(
+        region: 'us-central1',
+      ).httpsCallable('approveMember');
+      await callable.call(<String, dynamic>{
+        'groupId': groupId,
+        'userId': userId,
+      });
+      if (context.mounted) {
+        AppSnackbar.show(context, message: '?筌먲퐢沅?, type: AppSnackType.success);
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (context.mounted) {
+        AppSnackbar.show(
+          context,
+          message: '?筌뤾쑴理????덉넮: ${e.code}',
+          type: AppSnackType.error,
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _approving.remove(userId));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    final groupId = ref.watch(selectedGroupIdProvider);
+    if (user == null || groupId == null) {
+      return const Scaffold(body: Center(child: Text('?β돦裕??筌뤾쑴逾??熬곣뫗???紐껊퉵??')));
+    }
+
+    final memberStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('members')
+        .doc(user.uid)
+        .snapshots();
+    final periodKey = _currentPeriodKey();
+    final nowTs = Timestamp.now();
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: memberStream,
+      builder: (context, myMember) {
+        final permission = PermissionService.fromMemberData(
+          myMember.data?.data(),
+        );
+        final canOpenDashboard = permission.canAccessAdminDashboard();
+        final canManageMembers = permission.canManageMembers();
+        final canManageFinance = permission.canManageFinance();
+        final canManageRoles = permission.canManageRoles();
+
+        if (!canOpenDashboard) {
+          return const Scaffold(body: Center(child: Text('??⑥щ턄??? ??怨룸????덈펲.')));
+        }
+
+        final statsRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('stats')
+            .doc(periodKey);
+        final pendingRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('members')
+            .where('status', isEqualTo: 'pending');
+        final activeRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('members')
+            .where('status', isEqualTo: 'active');
+        final paymentsRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('feePeriods')
+            .doc(periodKey)
+            .collection('payments');
+        final upcomingRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('events')
+            .where('startAt', isGreaterThan: nowTs)
+            .limit(50);
+        final auditRef = FirebaseFirestore.instance
+            .collection('groups')
+            .doc(groupId)
+            .collection('auditLogs')
+            .orderBy('at', descending: true)
+            .limit(50);
+
+        return DefaultTabController(
+          length: 4,
+          child: Scaffold(
+            appBar: AppBar(
+              title: const Row(
+                children: [
+                  Icon(Icons.admin_panel_settings_outlined, size: 18),
+                  SizedBox(width: 6),
+                  Text('Admin Dashboard'),
+                ],
+              ),
+              bottom: const TabBar(
+                tabs: [
+                  Tab(text: 'Overview'),
+                  Tab(text: 'Approvals'),
+                  Tab(text: 'Fees'),
+                  Tab(text: 'Audit'),
+                ],
+              ),
+            ),
+            body: TabBarView(
+              children: [
+                ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    const SectionHeader(
+                      title: '?띠룇裕??,
+                      icon: Icons.dashboard_outlined,
+                    ),
+                    StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                      stream: statsRef.snapshots(),
+                      builder: (context, statsSnap) {
+                        final data =
+                            statsSnap.data?.data() ?? <String, dynamic>{};
+                        return SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              StatTile(
+                                title: '??戮?뎽 嶺뚮、?뉓떋?,
+                                value: '${data['activeMemberCount'] ?? '-'}',
+                              ),
+                              StatTile(
+                                title: '亦껋꼶梨뜻쾮??筌뤾쑴??,
+                                value: '${data['unpaidCount'] ?? '-'}',
+                              ),
+                              StatTile(
+                                title: '?????????源놁젧',
+                                value: '${data['eventCountThisMonth'] ?? '-'}',
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                      future: upcomingRef.get(),
+                      builder: (context, upcomingSnap) {
+                        final count =
+                            (upcomingSnap.data?.docs ??
+                                    const <
+                                      QueryDocumentSnapshot<
+                                        Map<String, dynamic>
+                                      >
+                                    >[])
+                                .where((e) => e.data()['isDeleted'] != true)
+                                .length;
+                        return AppCard(
+                          child: ListTile(
+                            title: const Text('??????노츎 ??源놁젧'),
+                            subtitle: Text('$count濾?),
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+                StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                  stream: pendingRef.snapshots(),
+                  builder: (context, pendingSnap) {
+                    if (!canManageMembers) {
+                      return const Center(child: Text('雅?굝??뇡????怨룸????덈펲.'));
+                    }
+                    if (pendingSnap.hasError)
+                      return Center(
+                        child: Text(_friendlyError(pendingSnap.error)),
+                      );
+                    if (!pendingSnap.hasData)
+                      return const Center(child: CircularProgressIndicator());
+                    final docs = pendingSnap.data!.docs;
+                    if (docs.isEmpty) {
+                      return const EmptyState(
+                        icon: Icons.verified_user_outlined,
+                        title: '?獄???????嶺뚮、?뉓떋???怨몃쾳',
+                        description: '?熬곣뫗???獄????????嶺뚮、?뉓떋?泥? ??怨룸????덈펲.',
+                      );
+                    }
+                    return ListView.builder(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: docs.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index == 0)
+                          return const SectionHeader(
+                            title: '?띠럾????獄???,
+                            icon: Icons.verified_user_outlined,
+                          );
+                        final doc = docs[index - 1];
+                        final loading = _approving.contains(doc.id);
+                        return AppCard(
+                          child: ListTile(
+                            title: Text(
+                              doc.data()['displayName'] as String? ?? doc.id,
+                            ),
+                            subtitle: Text('uid: ${doc.id}'),
+                            trailing: ElevatedButton(
+                              onPressed: loading
+                                  ? null
+                                  : () => _approve(
+                                      context: context,
+                                      groupId: groupId,
+                                      userId: doc.id,
+                                    ),
+                              child: Text(loading ? '嶺뚳퐣瑗?怨?뭄? : '?獄???),
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+                StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                  stream: activeRef.snapshots(),
+                  builder: (context, activeSnap) {
+                    if (!canManageFinance) {
+                      return const Center(child: Text('雅?굝??뇡????怨룸????덈펲.'));
+                    }
+                    if (activeSnap.hasError)
+                      return Center(
+                        child: Text(_friendlyError(activeSnap.error)),
+                      );
+                    if (!activeSnap.hasData)
+                      return const Center(child: CircularProgressIndicator());
+                    final members = activeSnap.data!.docs;
+                    if (members.isEmpty) {
+                      return const EmptyState(
+                        icon: Icons.group_off_outlined,
+                        title: '??戮?뎽 嶺뚮、?뉓떋???怨몃쾳',
+                        description: '????????㉱?洹먮뿫留???戮?뎽 嶺뚮、?뉓떋?泥? ??怨룸????덈펲.',
+                      );
+                    }
+                    return FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                      future: paymentsRef.get(),
+                      builder: (context, paymentSnap) {
+                        if (paymentSnap.hasData &&
+                            paymentSnap.data!.docs.isEmpty) {
+                          return const EmptyState(
+                            icon: Icons.payments_outlined,
+                            title: '???????⑥щ턄????怨몃쾳',
+                            description: '?????????? ??⑥щ턄??? ??怨룸????덈펲.',
+                          );
+                        }
+                        final paid =
+                            paymentSnap.data?.docs.map((d) => d.id).toSet() ??
+                            <String>{};
+                        final unpaidMembers = members
+                            .where((m) => !paid.contains(m.id))
+                            .toList();
+                        if (unpaidMembers.isEmpty) {
+                          return const EmptyState(
+                            icon: Icons.task_alt_outlined,
+                            title: '嶺뚮ㅄ維獄?嶺뚮、?뉓떋???? ?熬곣뫁??,
+                            description: '亦껋꼶梨뜻쾮?嶺뚮、?뉓떋?泥? ??怨룸????덈펲.',
+                          );
+                        }
+                        return ListView.builder(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: unpaidMembers.length + 1,
+                          itemBuilder: (context, index) {
+                            if (index == 0)
+                              return const SectionHeader(
+                                title: '亦껋꼶梨뜻쾮?嶺뚮、?뉓떋?,
+                                icon: Icons.payments_outlined,
+                              );
+                            final m = unpaidMembers[index - 1];
+                            return AppCard(
+                              child: ListTile(
+                                title: Text(
+                                  m.data()['displayName'] as String? ?? m.id,
+                                ),
+                                subtitle: Text('uid: ${m.id}'),
+                              ),
+                            );
+                          },
+                        );
+                      },
+                    );
+                  },
+                ),
+                StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                  stream: auditRef.snapshots(),
+                  builder: (context, auditSnap) {
+                    if (!canManageRoles) {
+                      return const Center(child: Text('雅?굝??뇡????怨룸????덈펲.'));
+                    }
+                    if (auditSnap.hasError)
+                      return Center(
+                        child: Text(_friendlyError(auditSnap.error)),
+                      );
+                    if (!auditSnap.hasData)
+                      return const Center(child: CircularProgressIndicator());
+                    final docs = auditSnap.data!.docs;
+                    if (docs.isEmpty)
+                      return const Center(child: Text('?띠룆흮亦??β돦裕??먯쾸? ??怨룸????덈펲.'));
+                    return ListView.builder(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: docs.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index == 0)
+                          return const SectionHeader(
+                            title: '?띠룆흮亦??β돦裕??,
+                            icon: Icons.history_outlined,
+                          );
+                        final data = docs[index - 1].data();
+                        final action = data['action'] as String? ?? '-';
+                        final actor = data['actorUid'] as String? ?? '-';
+                        final target = data['targetUid'] as String? ?? '-';
+                        return AppCard(
+                          child: ListTile(
+                            title: Text(action),
+                            subtitle: Text('actor: $actor / target: $target'),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class NotificationSettingsScreen extends ConsumerWidget {
+  const NotificationSettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final groupId = ref.watch(selectedGroupIdProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    if (groupId == null || user == null) {
+      return const Scaffold(body: Center(child: Text('??怨뚰맟?熬곣뫗諭????깆젧???낅슣?섋땻??')));
+    }
+
+    final settingsRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('members')
+        .doc(user.uid)
+        .collection('notificationSettings')
+        .doc('default');
+
+    Future<void> saveSettings({
+      required bool noticeEnabled,
+      required bool eventReminderEnabled,
+      required bool noResponseReminderEnabled,
+    }) async {
+      try {
+        await settingsRef.set({
+          'noticeEnabled': noticeEnabled,
+          'eventReminderEnabled': eventReminderEnabled,
+          'noResponseReminderEnabled': noResponseReminderEnabled,
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      } on FirebaseException catch (e) {
+        if (!context.mounted) return;
+        final msg = e.code == 'permission-denied'
+            ? kPermissionDeniedMessage
+            : '???逾????깆젧 ???????덉넮: ${e.code}';
+        AppSnackbar.show(context, message: msg, type: AppSnackType.error);
+      }
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Row(
+          children: [
+            Icon(Icons.notifications_outlined, size: 18),
+            SizedBox(width: 6),
+            Text('???逾????깆젧'),
+          ],
+        ),
+      ),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: settingsRef.snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError)
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(_friendlyError(snapshot.error)),
+              ),
+            );
+          if (!snapshot.hasData)
+            return const Center(child: CircularProgressIndicator());
+          final data = snapshot.data!.data() ?? <String, dynamic>{};
+          final noticeEnabled = data['noticeEnabled'] as bool? ?? true;
+          final eventReminderEnabled =
+              data['eventReminderEnabled'] as bool? ?? true;
+          final noResponseReminderEnabled =
+              data['noResponseReminderEnabled'] as bool? ?? true;
+
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              const SectionHeader(
+                title: '???逾????깆젧',
+                icon: Icons.notifications_outlined,
+              ),
+              AppCard(
+                child: Column(
+                  children: [
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('??ㅻ쾴? ???逾?),
+                      value: noticeEnabled,
+                      onChanged: (v) => saveSettings(
+                        noticeEnabled: v,
+                        eventReminderEnabled: eventReminderEnabled,
+                        noResponseReminderEnabled: noResponseReminderEnabled,
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('D-1 ??源놁젧 ???逾?),
+                      value: eventReminderEnabled,
+                      onChanged: (v) => saveSettings(
+                        noticeEnabled: noticeEnabled,
+                        eventReminderEnabled: v,
+                        noResponseReminderEnabled: noResponseReminderEnabled,
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('?獄???13:00 亦껋꼶梨??????逾?),
+                      value: noResponseReminderEnabled,
+                      onChanged: (v) => saveSettings(
+                        noticeEnabled: noticeEnabled,
+                        eventReminderEnabled: eventReminderEnabled,
+                        noResponseReminderEnabled: v,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ResponseButton extends StatelessWidget {
+  const _ResponseButton({
+    required this.label,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton(
+      style: OutlinedButton.styleFrom(
+        backgroundColor: selected ? AppTheme.primaryLight : null,
+        foregroundColor: Theme.of(context).colorScheme.primary,
+        side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      onPressed: onPressed,
+      child: Text(label),
+    );
+  }
+}
+
+Future<void> _writeResponse({
+  required String groupId,
+  required String eventId,
+  required String uid,
+  required String response,
+  required BuildContext context,
+}) async {
+  final span = PerfSpan('Write response').start();
+  try {
+    await HapticFeedback.lightImpact();
+    await FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('events')
+        .doc(eventId)
+        .collection('responses')
+        .doc(uid)
+        .set({
+          'response': response,
+          'respondedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+    FirestoreMetrics.instance.addWrites();
+    if (context.mounted) {
+      AppSnackbar.show(
+        context,
+        message: '??얜Ŧ堉?????縕ョ뵳???곕????덈펲.',
+        type: AppSnackType.success,
+      );
+    }
+  } on FirebaseException catch (e) {
+    final message = toUserMessage(e);
+    if (context.mounted) {
+      AppSnackbar.show(context, message: message, type: AppSnackType.error);
+    }
+  } finally {
+    span.end();
+    FirestoreMetrics.instance.dump('response');
+  }
+}
+
+String _eventPrimaryPlace(Map<String, dynamic> eventData) {
+  final locationName = eventData['locationName']?.toString();
+  final location = eventData['location']?.toString();
+  final address = eventData['address']?.toString();
+
+  if (locationName != null && locationName.isNotEmpty) return locationName;
+  if (location != null && location.isNotEmpty) return location;
+  if (address != null && address.isNotEmpty) return address;
+  return '-';
+}
+
+String? _eventMapQuery(Map<String, dynamic> eventData) {
+  final address = eventData['address']?.toString();
+  final locationName = eventData['locationName']?.toString();
+  final location = eventData['location']?.toString();
+
+  if (address != null && address.isNotEmpty) return address;
+  if (locationName != null && locationName.isNotEmpty) return locationName;
+  if (location != null && location.isNotEmpty) return location;
+  return null;
+}
+
+String _formatDate(DateTime date) {
+  final m = date.month.toString().padLeft(2, '0');
+  final d = date.day.toString().padLeft(2, '0');
+  final h = date.hour.toString().padLeft(2, '0');
+  final min = date.minute.toString().padLeft(2, '0');
+  return '$m.$d $h:$min';
+}
+
+String _currentPeriodKey([DateTime? date]) {
+  final now = date ?? DateTime.now();
+  final month = now.month.toString().padLeft(2, '0');
+  return '${now.year}-$month';
+}
+
+String _friendlyError(Object? error) {
+  if (error == null) return kDefaultUserErrorMessage;
+  return toUserMessage(error);
+}
+

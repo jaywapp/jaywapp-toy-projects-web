@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "875777689976",
+    "project_id": "moyeora-dev",
+    "storage_bucket": "moyeora-dev.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:875777689976:android:a6999aa9b83f739f3aa08d",
+        "android_client_info": {
+          "package_name": "com.jaywapp.moyeora"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "875777689976-0ol2jhsa73rupkd5covodj685gq02gee.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.jaywapp.moyeora",
+            "certificate_hash": "35672d2e29dcb63d4086b7d024a659f166ab4130"
+          }
+        },
+        {
+          "client_id": "875777689976-q8d1djt6ochk8bbor5p180lqnl7a9ugi.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBsaz06oC1jlhpvUFkmJSepjuXmo-QV30w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "875777689976-q8d1djt6ochk8bbor5p180lqnl7a9ugi.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
