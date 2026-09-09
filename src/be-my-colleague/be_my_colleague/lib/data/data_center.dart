@@ -6,7 +6,7 @@ import 'package:be_my_colleague/model/member.dart';
 import 'package:be_my_colleague/model/account.dart';
 import 'package:be_my_colleague/model/club.dart';
 import 'package:be_my_colleague/model/schedule.dart';
-import 'package:be_my_colleague/submodules/jaywapp-dart-google-sheet/google-sheet-manager.dart';
+import 'package:jaywapp_google_sheet/google_sheet_manager.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 class DataCenter {

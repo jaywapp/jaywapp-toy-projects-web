@@ -92,9 +92,9 @@ export function PickAround(distance){
 
             PickDatas(aroundDatas);
             SetBounds(bounds);
+        }, function(error) {
+            console.warn('Unable to determine current position', error.code);
         });
-
-        console.log('fail to get current position');
     }
     else{
 

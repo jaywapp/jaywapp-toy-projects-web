@@ -27,8 +27,10 @@ function GetDistance(lat1, lon1, lat2, lon2){
     var lat1 = toRad(lat1);
     var lat2 = toRad(lat2);
 
-    var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.sin(dLon/2) * Math.sin(dLon/2) * Math.cos(lat1) * Math.cos(lat2); 
+    var sinLat = Math.sin(dLat/2);
+    var sinLon = Math.sin(dLon/2);
+    var a = sinLat * sinLat +
+    sinLon * sinLon * Math.cos(lat1) * Math.cos(lat2);
     var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
     var d = R * c;
     return d;

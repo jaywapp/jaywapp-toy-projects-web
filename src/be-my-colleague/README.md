@@ -30,3 +30,7 @@ lib/
 - 회비 납부 현황 추적
 - 일정 관리
 - 네이버 지도 연동
+
+## 로컬 의존성과 검증
+
+Sheets 매니저는 같은 모노레포의 ../../jaywapp-dart-google-sheet path 패키지에서 가져온다. 기존 원격 서브모듈 초기화는 필요하지 않다. be_my_colleague에서 flutter pub get 후 flutter test를 실행한다. 실제 로그인 전 첫 화면과 계정 없는 Sheets 경계는 외부 접속 없이 검증한다.
