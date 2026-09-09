@@ -1,0 +1,10 @@
+name: jaywapp_google_sheet
+description: Google Sheets range and row helpers shared by local applications.
+version: 0.0.1
+publish_to: none
+environment:
+  sdk: ^3.5.3
+dependencies:
+  google_sign_in: ^5.4.1
+  googleapis: ^13.2.0
+  http: ^1.2.2

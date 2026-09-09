@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import '../../../jaywapp-dart-google-sheet/google-sheet-manager.dart';
+import 'package:jaywapp_google_sheet/google_sheet_manager.dart';
 
 class MemorySheetManager extends GoogleSheetManager {
   final List<List<Object?>> rows;

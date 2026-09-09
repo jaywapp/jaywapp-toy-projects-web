@@ -26,3 +26,5 @@ orchestrator: Codex
 제품 변경: 시장 데이터 요청 실패 때 페이지를 유지하고 HTTP/데이터 배열을 검증한다. 동시 more 요청은 순차 처리해 페이지 중복을 막는다. GoogleSheetManager의 FFI Bool predicate를 Dart bool로 고치고, 짧은 행·마지막 열·비양수 인덱스 경계를 바로잡았다.
 재현: 루트 `node --test tests/*.test.cjs` 9개, `C:\flutter\bin\cache\dart-sdk\bin\dart.exe tests/google-sheet-range.test.dart` 13개. be-my-colleague/be_my_colleague에서 `flutter test --no-pub test/google_sheet_manager_test.dart` 6개. 시장 앱에서 `npm test -- --watchAll=false --runInBand` 3개. moyeora/functions에서 `npm test` 4개.
 원본 lock/불필요한 빌드 생성변경은 복구했다. Functions의 생성된 lib 출력은 커밋에서 제외하고 원본을 복구했다. SDK 캐시/네트워크 복원은 자동 승인 escalation을 거쳤다.
+
+후속 갱신: proto-shop-finder 테스트와 BeMyColleague 누락 연결은 [SDK·연동 테스트 복구 결과](sdk-test-recovery-tasks.md)에서 해결했다. 위 표는 최초 검증 시점 기록이다.
