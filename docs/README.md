@@ -14,3 +14,5 @@
 - 시크릿·토큰·키·`.env` 값은 문서·로그·커밋에 기록하지 않습니다.
 
 이 저장소의 기존 문서 인덱스와 생성 규칙이 있으면 그 규칙을 우선하며, 기존 파일을 덮어쓰지 않습니다.
+
+- 성능·안정성 점검: [분석](runtime-hardening-analysis.md), [설계](runtime-hardening-design.md), [검증 결과](runtime-hardening-tasks.md)
