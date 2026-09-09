@@ -1,4 +1,3 @@
-import 'dart:ffi';
 import 'package:be_my_colleague/Service/GoogleHttpClient.dart';
 import 'package:googleapis/sheets/v4.dart' as sheets;
 import 'package:google_sign_in/google_sign_in.dart';
@@ -50,7 +49,7 @@ class GoogleSheetManager {
   }
 
   Future<List<List<Object?>>?> GetRows(
-      String sheetName, Bool Function(List<Object?>) checker) async {
+      String sheetName, bool Function(List<Object?>) checker) async {
     List<List<Object?>> result = [];
     var values = await GetActiveValues(sheetName) ?? List.empty();
 
@@ -94,13 +93,14 @@ class GoogleSheetManager {
   Future<List<List<Object?>>?> GetRowsByCellValue(
       String sheetName, int columnIndex, Object value) async {
     List<List<Object?>> result = [];
+    if (columnIndex < 1) return result;
     var values = await GetActiveValues(sheetName) ?? List.empty();
     var idx = columnIndex - 1;
 
     for (int i = 0; i < values.length; i++) {
       var row = values[i];
 
-      if (row.length <= columnIndex && row[idx] == value) {
+      if (row.length >= columnIndex && row[idx] == value) {
         result.add(row);
       }
     }
@@ -109,7 +109,7 @@ class GoogleSheetManager {
   }
 
   Future<int> GetIndex(String sheetName, int columnIndex, Object? value) async {
-    if (value == null) return -1;
+    if (value == null || columnIndex < 1) return -1;
 
     var values = await GetActiveValues(sheetName) ?? List.empty();
     var idx = columnIndex - 1;
@@ -117,7 +117,7 @@ class GoogleSheetManager {
     for (int i = 0; i < values.length; i++) {
       var row = values[i];
 
-      if (row.length > columnIndex) {
+      if (row.length >= columnIndex) {
         if (row[idx] == value) {
           return i + 1;
         }

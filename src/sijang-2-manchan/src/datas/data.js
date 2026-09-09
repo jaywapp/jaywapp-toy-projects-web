@@ -4,18 +4,31 @@ const perPage = 9;
 
 let page = 1;
 let Datas = new Array();
+let pendingUpdate = Promise.resolve();
 
-const Update = async ( callback ) =>{
+const Update = ( callback ) =>{
+    const operation = pendingUpdate.then(async () => {
 
-    let url = Url(page++, perPage);
+    let url = Url(page, perPage);
 
-    const res = await fetch(url).then((res) => res.json());
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error('Market request failed');
+    }
+    const res = await response.json();
+    if (!res || !Array.isArray(res.data)) {
+        throw new Error('Invalid market response');
+    }
 
     res.data.forEach(d => {
         Datas.push(d);
     });
 
+    page++;
     callback();
+    });
+    pendingUpdate = operation.catch(() => {});
+    return operation;
 }
 
 function Url(page, perPage){
